@@ -1,3 +1,7 @@
+import os
+import uuid
+import time
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -16,6 +20,30 @@ class OptimizationDashboard:
         self.scanner = None
         self.analyzer = None
 
+    def _cleanup_old_cache_files(self, max_age_hours: int = 24):
+        """
+        Implements a 'Lazy Garbage Collection' pattern.
+        Scans the /tmp directory and deletes Parquet files older than max_age_hours.
+        Crucial for preventing disk space exhaustion on Streamlit Community Cloud.
+        """
+        tmp_dir = Path("/tmp")
+        if not tmp_dir.exists():
+            return
+        
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        
+        # Iterate over all cached parquet files specifically created by this app
+        for cache_file in tmp_dir.glob("ctrader_opt_*.parquet"):
+            try:
+                # Check file modification time (st_mtime)
+                file_mtime = cache_file.stat().st_mtime
+                if (current_time - file_mtime) > max_age_seconds:
+                    cache_file.unlink() # Delete the file
+            except Exception:
+                # Silently ignore files that are locked or already deleted
+                pass
+
     def _safe_range_slider(self, label: str, series: pd.Series, step: float = None) -> tuple:
         """Safe slider that prevents UI crash when min == max."""
         s_min = float(series.min()) if not series.empty else 0.0
@@ -25,27 +53,101 @@ class OptimizationDashboard:
         return st.sidebar.slider(label, min_value=s_min, max_value=s_max, value=(s_min, s_max), step=step)
 
     def _render_sidebar(self) -> tuple:
-        st.sidebar.header("📁 Folder Path")
-        raw_input_dir = st.sidebar.text_input(
-            "Optimization folders location:",
-            value=self.initial_root_dir,
-            help="Root directory containing the numbered test folders.",
-        )
-        self.root_dir = str(raw_input_dir).strip().strip('"').strip("'").replace("\\ ", " ")
-        self.scanner = CTraderScanner(self.root_dir)
-        st.sidebar.caption(f"📍 **Active Path:**\n`{self.scanner.root_dir}`")
+        st.sidebar.header("📁 Data Source")
 
-        force_rescan = st.sidebar.button("🔄 Rescan / Clear Cache", use_container_width=True)
-        if force_rescan:
-            st.toast("⚡ Cache cleared, fast JSON scan initiated!")
+        run_mode = os.environ.get("ENV_MODE", "local").lower()
+        
+        raw_df = None
 
-        progress_bar = st.sidebar.empty()
-        raw_df = self.scanner.get_data(
-            force_rescan=force_rescan,
-            progress_callback=lambda p: (
-                progress_bar.progress(p, text="Processing folders (JSON)...") if p < 1.0 else progress_bar.empty()
-            ),
-        )
+        # ==========================================
+        # CLOUD MODE: ZIP UPLOAD (No folder path)
+        # ==========================================
+        if run_mode == "cloud":
+            st.sidebar.caption("☁️ Cloud Engine (In-Memory & Cache)")
+            
+            # 1. Check if the user already has an active session in the URL
+            session_id = st.query_params.get("session_id")
+            cache_file = Path(f"/tmp/ctrader_opt_{session_id}.parquet") if session_id else None
+
+            # 2. RESTORE FROM CACHE (If URL has ID and file exists on server)
+            if cache_file and cache_file.exists():
+                st.sidebar.success("✅ Session restored successfully!")
+                
+                if "cached_df" not in st.session_state:
+                    # Instantly load the 200KB Parquet instead of re-uploading the ZIP
+                    raw_df = pd.read_parquet(cache_file)
+                    st.session_state["cached_df"] = raw_df
+                else:
+                    raw_df = st.session_state["cached_df"]
+
+                # Allow user to completely reset their session
+                if st.sidebar.button("🗑️ Start New Session", use_container_width=True):
+                    cache_file.unlink(missing_ok=True)
+                    st.query_params.clear()
+                    st.session_state.clear()
+                    st.rerun()
+
+            # 3. FRESH UPLOAD (No valid session found)
+            else:
+                uploaded_zip = st.sidebar.file_uploader(
+                    "Upload cTrader optimization ZIP file:", 
+                    type=["zip"]
+                )
+                
+                if uploaded_zip is not None:
+                    if "cached_df" not in st.session_state:
+                        with st.spinner("📦 Processing ZIP in memory (I/O free)..."):
+                            
+                            # Initialize scanner with the in-memory ZIP
+                            self.scanner = CTraderScanner(zip_file=uploaded_zip)
+                            raw_df = self.scanner.get_data()
+                            
+                            if raw_df is not None and not raw_df.empty:
+                                # Trigger Garbage Collection before creating a new file
+                                self._cleanup_old_cache_files(max_age_hours=24)
+                                
+                                # Generate a unique short ID for this upload
+                                new_session_id = str(uuid.uuid4())[:8]
+                                new_cache_file = Path(f"/tmp/ctrader_opt_{new_session_id}.parquet")
+                                
+                                # Ensure /tmp directory exists (standard on Linux/macOS)
+                                new_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                                
+                                # Save the highly compressed lightweight Parquet file
+                                raw_df.to_parquet(new_cache_file, index=False)
+                                
+                                # Inject the ID into the browser's URL and save to RAM
+                                st.query_params["session_id"] = new_session_id
+                                st.session_state["cached_df"] = raw_df
+                                
+                                # Rerun to switch the UI from "Uploader" to "Restored" mode
+                                st.rerun()
+
+        # ==========================================
+        # LOCAL MODE: CLI / Folder path
+        # ==========================================
+        else:
+            st.sidebar.caption("💻 Run locally (Folder mode)")
+            raw_input_dir = st.sidebar.text_input(
+                "Optimization folders location:",
+                value=self.initial_root_dir,
+                help="The root directory, which contains the test folders.",
+            )
+            self.root_dir = str(raw_input_dir).strip().strip('"').strip("'").replace("\\ ", " ")
+            self.scanner = CTraderScanner(self.root_dir)
+            st.sidebar.caption(f"📍 **Current route:**\n`{self.scanner.root_dir}`")
+
+            force_rescan = st.sidebar.button("🔄 Rescan / Clear Cache", use_container_width=True)
+            if force_rescan:
+                st.toast("⚡ Cache cleared, fresh scan starts!")
+
+            progress_bar = st.sidebar.empty()
+            raw_df = self.scanner.get_data(
+                force_rescan=force_rescan,
+                progress_callback=lambda p: (
+                    progress_bar.progress(p, text="Processing folders (JSON)...") if p < 1.0 else progress_bar.empty()
+                ),
+            )
 
         if raw_df is None or raw_df.empty or "Total Trades_all" not in raw_df.columns:
             return None, {}, None
