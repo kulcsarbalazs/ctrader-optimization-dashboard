@@ -192,20 +192,22 @@ class CTraderScanner:
                             try:
                                 data = json.loads(f.read().decode('utf-8', errors='ignore'))
                                 row_data.update(self._extract_cbotset_logic(data))
+                                # MEMORY OPTIMIZATION: Clear the loaded JSON dictionary ONLY if successfully created
+                                del data 
                             except Exception:
                                 pass
-                            finally:
-                                # MEMORY OPTIMIZATION: Clear the loaded JSON dictionary
-                                del data 
 
                     # 2. Stream and Parse Report (HTML)
                     report_file = next((f for f in z.namelist() if f.startswith(folder_path) and f.lower().endswith(('.html', '.htm'))), None)
                     if report_file:
                         with z.open(report_file) as f:
-                            html_content = f.read().decode('utf-8', errors='ignore')
-                            row_data.update(self._extract_report_logic(html_content))
-                            # MEMORY OPTIMIZATION: Immediately delete the large HTML string from RAM
-                            del html_content
+                            try:
+                                html_content = f.read().decode('utf-8', errors='ignore')
+                                row_data.update(self._extract_report_logic(html_content))
+                                # MEMORY OPTIMIZATION: Immediately delete the large HTML string from RAM
+                                del html_content
+                            except Exception:
+                                pass
                     
                     results.append(row_data)
 
