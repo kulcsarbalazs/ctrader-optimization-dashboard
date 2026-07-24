@@ -300,11 +300,18 @@ class CTraderScanner:
     # ==========================================
     def _finalize_dataframe(self, results: list) -> pd.DataFrame:
         """Converts the raw dictionaries into a strictly typed DataFrame."""
+        if not results:
+            return pd.DataFrame()
+            
         df = pd.DataFrame(results).sort_values(by="Test_ID")
         
+        # Modern Pandas dtype conversion replacing the deprecated errors='ignore'
         for col in df.columns:
             if col != "Test_ID":
-                df[col] = pd.to_numeric(df[col], errors='ignore')
+                try:
+                    df[col] = pd.to_numeric(df[col], errors='raise')
+                except (ValueError, TypeError):
+                    pass
                 
         for mode in ["all", "long", "short"]:
             trades_col = f"Total Trades_{mode}"
