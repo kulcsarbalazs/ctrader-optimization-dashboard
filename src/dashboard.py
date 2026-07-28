@@ -19,6 +19,7 @@ class OptimizationDashboard:
         self.root_dir = initial_root_dir
         self.scanner = None
         self.analyzer = None
+        self.run_mode = os.environ.get("ENV_MODE", "local").lower()
 
     def _cleanup_old_cache_files(self, max_age_hours: int = 24):
         """
@@ -55,14 +56,12 @@ class OptimizationDashboard:
     def _render_sidebar(self) -> tuple:
         st.sidebar.header("📁 Data Source")
 
-        run_mode = os.environ.get("ENV_MODE", "local").lower()
-        
         raw_df = None
 
         # ==========================================
         # CLOUD MODE: ZIP UPLOAD (No folder path)
         # ==========================================
-        if run_mode == "cloud":
+        if self.run_mode == "cloud":
             st.sidebar.caption("☁️ Cloud Engine (In-Memory & Cache)")
             
             # 1. Check if the user already has an active session in the URL
@@ -219,6 +218,20 @@ class OptimizationDashboard:
             "swaps_range": swaps_range,
         }
 
+        st.sidebar.divider()
+        st.sidebar.markdown("### 👨‍💻 About the Author")
+        st.sidebar.markdown("Hi! I build high-performance cTrader tools. If this tool saved you time or CPU costs, consider supporting the project!")
+        
+        # Donatr.ee / Ko-fi gomb
+        st.sidebar.markdown(
+            """
+            <a href='https://donatr.ee/kulcsarbalazs' target='_blank'>
+                <img src='https://img.shields.io/badge/Support_me-Donatr.ee-FF5E5B?style=for-the-badge' alt='Support me' />
+            </a>
+            """,
+            unsafe_allow_html=True
+        )
+
         return active_df, filters, mode_label
 
     def _render_metrics(self, total_count: int, filtered_df: pd.DataFrame, mode_label: str):
@@ -365,6 +378,35 @@ class OptimizationDashboard:
             file_name="sweet_spot_strategies.csv", mime="text/csv"
         )
 
+    def _render_empty_state(self):
+        """Displays instructions if no data has been loaded yet."""
+
+        if self.run_mode == "cloud":
+            st.info("👈 **Get Started:** Please upload your cTrader Optimization `.zip` file in the sidebar to begin.")
+            st.markdown("""
+            ### ☁️ How to use the Cloud Analyzer:
+            1. **Save Results:** In cTrader, save your optimization results once the backtesting process is complete.
+            2. **Compress to ZIP:** Locate the saved optimization folder on your computer and compress the entire directory into a single `.zip` archive.
+            3. **Upload & Analyze:** Upload this `.zip` file using the uploader in the left sidebar. The engine will automatically parse and evaluate the data in-memory!
+            """)
+        else:
+            st.info("👈 **Get Started:** Please enter the path to your optimization folders in the sidebar, or place them in the root directory.")
+            st.markdown("""
+            ### 💻 How to use the Local Analyzer:
+            1. **Save Results:** In cTrader, save your optimization results once the backtesting process is complete.
+            2. **Set Data Path:** Enter the absolute path of the saved optimization folder in the left sidebar configuration panel.
+            3. **Scan & Analyze:** The engine will bypass memory limits and stream the results directly from your SSD/HDD!
+            """)
+
+    def _render_disclaimer(self):
+        """Legal notice placed at the very bottom of the page."""
+        st.divider()
+        st.caption("""
+        ⚠️ **Disclaimer:** This software is provided "AS IS" for educational and analytical purposes only. 
+        It does not constitute financial advice. The author is not responsible for any financial losses incurred through the use of this software or strategies derived from its output. 
+        Past performance in backtests is not indicative of future results.
+        """)
+
     def run(self):
         st.title("🚀 cTrader Multi-Folder Optimization Analyzer")
         st.write("Automated parsing, filtering, and Machine Learning parameter research for cTrader backtest optimizations.")
@@ -373,6 +415,7 @@ class OptimizationDashboard:
 
         if df is None or df.empty:
             st.error("❌ No valid test folders found at the specified path!")
+            self._render_empty_state()
             return
 
         filtered_df = self.analyzer.filter_strategies(df, filters)
@@ -384,3 +427,5 @@ class OptimizationDashboard:
             self._render_search_space_pruning(filtered_df)
         else:
             self._render_filter_diagnostics(df, filters)
+
+        self._render_disclaimer()

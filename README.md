@@ -1,5 +1,10 @@
 # 🚀 cTrader Multi-Folder Optimization Analyzer
 
+![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
+![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat&logo=streamlit&logoColor=white)
+![License](https://img.shields.io/badge/License-BSL%201.1-lightgrey.svg)
+[![Support](https://img.shields.io/badge/Support%20This%20Project-Donatr.ee%20%2F%20Ko--fi-orange.svg)](https://donatr.ee/kulcsarbalazs)
+
 ![Active Trading Mode](assets/header.jpg)
 
 A lightning-fast, highly optimized Python/Streamlit dashboard designed to parse, filter, and analyze massive cTrader algorithmic backtest optimizations. 
@@ -50,7 +55,7 @@ Stop guessing which parameter matters. A built-in **Random Forest** model analyz
 ### 5. Deep Risk Filtering
 Filter your raw data using strict institutional-grade metrics via the sidebar: Max Consecutive Losses, Largest Losing Trade, Minimum Trade Count, and Swap impacts.
 
-![Data Source](assets/data-source.jpg) ![Main Filters](assets/main-filters.jpg) ![Detailed Filters](assets/risk-filters.jpg)
+<img src="assets/data-source.jpg" width="270"> <img src="assets/main-filters.jpg" width="270"> <img src="assets/risk-filters.jpg" width="272">
 
 ---
 
@@ -90,6 +95,22 @@ If you want to process massive backtests locally using your SSD:
 ## ☁️ Cloud Deployment Instructions
 
 🔗 **[Live Cloud Demo: Click Here to Try The Analyzer](https://ctrader-optimization-dashboard.streamlit.app/)**
+
+---
+
+## 🗺️ Roadmap
+
+We are continuously improving this analyzer to provide institutional-grade tools for retail algorithmic traders.
+
+**✅ Completed**
+* [x] In-Memory ZIP Streaming (Cloud Bypass)
+* [x] Lazy Garbage Collection for 1GB RAM limits
+* [x] Machine Learning (Random Forest) Feature Importance
+* [x] Search Space Pruning & Optimization Re-targeting
+
+**🚧 In Progress / Upcoming**
+* [ ] **Trend & Volatility Comparison:** Visual comparison of filtered strategies based on balance curves, trend stability, and drawdown excursions.
+* [ ] **Time-Series Breakdown:** Weekly, monthly, and yearly performance heatmaps to identify seasonal vulnerabilities in specific parameter sets.
 
 ---
 
