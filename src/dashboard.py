@@ -14,7 +14,7 @@ class OptimizationDashboard:
     """Controls the entire Streamlit user interface."""
 
     def __init__(self, initial_root_dir: str = "."):
-        st.set_page_config(page_title="cTrader OOP Analyzer", layout="wide")
+        st.set_page_config(page_title="cTrader Optimization Analyzer", layout="wide")
         self.initial_root_dir = initial_root_dir
         self.root_dir = initial_root_dir
         self.scanner = None
