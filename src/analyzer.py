@@ -36,14 +36,28 @@ class StrategyAnalyzer:
             (df["Average Trade"] >= filters["avg_trade_range"][0]) &
             (df["Average Trade"] <= filters["avg_trade_range"][1])
         )
+        cond &= self.trend_mask(df, filters.get("trend_filters", {}))
         return df[cond]
+
+    @staticmethod
+    def trend_mask(df: pd.DataFrame, trend_filters: Dict[str, Any]) -> pd.Series:
+        """
+        Applies the trend & stability filters: {column: (operator, bound, active)}.
+        Inactive (fully open) filters let every row pass, including rows without time-series data.
+        """
+        mask = pd.Series(True, index=df.index)
+        for col, (op, bound, active) in trend_filters.items():
+            if not active or col not in df.columns:
+                continue
+            mask &= (df[col] >= bound) if op == ">=" else (df[col] <= bound)
+        return mask
 
     def get_parameter_columns(self, df: pd.DataFrame) -> List[str]:
         ignore_prefixes = [
             "Test_ID", "Total Trades", "Winning Trades", "Losing Trades", 
             "Profit Factor", "Equity Drawdown", "Net Profit", "Win Rate", 
             "Swaps", "Max Cons. Losses", "Largest Win", "Largest Loss", "Average Trade",
-            "PnL_Series"
+            "PnL_Series", "Trend R²", "Ulcer Index", "Max Underwater", "Weekly "
         ]
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 

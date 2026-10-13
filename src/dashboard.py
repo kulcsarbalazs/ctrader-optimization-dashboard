@@ -1,11 +1,14 @@
 import os
+import json
 import uuid
 import time
 from pathlib import Path
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from typing import Dict, Any
 
 from src.scanner import CTraderScanner
@@ -21,6 +24,31 @@ def _cached_time_series(series_df: pd.DataFrame, mode: str, freq: str, cumulativ
 @st.cache_data(max_entries=16, show_spinner=False)
 def _cached_month_heatmap(series_df: pd.DataFrame, mode: str, metric: str):
     return TimeSeriesAnalyzer.month_heatmap(TimeSeriesAnalyzer.expand(series_df, mode), metric)
+
+
+@st.cache_data(max_entries=8, show_spinner=False)
+def _cached_trend_metrics(series_df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    mats = TimeSeriesAnalyzer.weekly_matrices(TimeSeriesAnalyzer.expand(series_df, mode))
+    # The equity low is account-wide, so it only applies when both directions are analyzed.
+    return TimeSeriesAnalyzer.trend_metrics(mats, use_equity=(mode == "all"))
+
+
+@st.cache_data(max_entries=24, show_spinner=False)
+def _cached_set_curves(series_df: pd.DataFrame, mode: str, roi: bool) -> Dict[str, pd.DataFrame]:
+    mats = TimeSeriesAnalyzer.weekly_matrices(TimeSeriesAnalyzer.expand(series_df, mode))
+    equity = TimeSeriesAnalyzer.equity_curves(mats, roi=roi)
+    drawdown = TimeSeriesAnalyzer.drawdown_curves(mats, use_equity=(mode == "all"))
+    return {
+        "equity": equity,
+        "equity_stats": TimeSeriesAnalyzer.band_stats(equity),
+        "drawdown_stats": TimeSeriesAnalyzer.band_stats(drawdown),
+    }
+
+
+TREND_COLUMNS = ["Trend R²", "Ulcer Index", "Max Underwater (w)", "Weekly Vol %", "Weekly Sharpe"]
+MAX_SAVED_SETS = 4
+SET_COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A"]
+
 
 class OptimizationDashboard:
     """Controls the entire Streamlit user interface."""
@@ -48,7 +76,7 @@ class OptimizationDashboard:
         max_age_seconds = max_age_hours * 3600
         
         # Iterate over all cached parquet files specifically created by this app
-        for cache_file in tmp_dir.glob("ctrader_opt_*.parquet"):
+        for cache_file in [*tmp_dir.glob("ctrader_opt_*.parquet"), *tmp_dir.glob("ctrader_opt_*_sets.json")]:
             try:
                 # Check file modification time (st_mtime)
                 file_mtime = cache_file.stat().st_mtime
@@ -101,6 +129,7 @@ class OptimizationDashboard:
                 # Allow user to completely reset their session
                 if st.sidebar.button("🗑️ Start New Session", use_container_width=True):
                     cache_file.unlink(missing_ok=True)
+                    Path(f"/tmp/ctrader_opt_{session_id}_sets.json").unlink(missing_ok=True)
                     st.query_params.clear()
                     st.session_state.clear()
                     st.rerun()
@@ -191,6 +220,10 @@ class OptimizationDashboard:
             if col_name in active_df.columns:
                 active_df[col] = active_df[col_name]
 
+        if "PnL_Series" in active_df.columns and active_df["PnL_Series"].notna().any():
+            trend_df = _cached_trend_metrics(active_df[["Test_ID", "PnL_Series"]], mode)
+            active_df = active_df.drop(columns=TREND_COLUMNS, errors="ignore").merge(trend_df, on="Test_ID", how="left")
+
         self.analyzer = StrategyAnalyzer(active_df)
 
         # --- 3. MAIN PERFORMANCE FILTERS ---
@@ -225,6 +258,31 @@ class OptimizationDashboard:
         avg_trade_range = self._safe_range_slider("Average Trade Result", active_df["Average Trade"])
         swaps_range = self._safe_range_slider("Swaps Range", active_df["Swaps"])
 
+        # --- 5. TREND & STABILITY FILTERS ---
+        trend_filters = {}
+        if "Trend R²" in active_df.columns:
+            st.sidebar.divider()
+            st.sidebar.header("📈 Trend & Stability Filters")
+            min_r2 = st.sidebar.slider(
+                "Min Trend Stability (R²)", -1.0, 1.0, -1.0, step=0.01,
+                help="Linear fit of the weekly balance curve: 1 = perfectly steady growth, negative = steady decline.",
+            )
+            ulcer_max = float(np.ceil(active_df["Ulcer Index"].max() or 1.0))
+            max_ulcer = st.sidebar.slider(
+                "Max Ulcer Index", 0.0, max(ulcer_max, 1.0), max(ulcer_max, 1.0), step=0.05,
+                help="Depth and duration of drawdowns combined (root mean square of the weekly drawdown %).",
+            )
+            uw_max = int(active_df["Max Underwater (w)"].max() or 1)
+            max_underwater = st.sidebar.slider(
+                "Max Time Underwater (weeks)", 0, max(uw_max, 1), max(uw_max, 1),
+                help="Longest stretch the balance stayed below its previous peak.",
+            )
+            trend_filters = {
+                "Trend R²": (">=", min_r2, min_r2 > -1.0),
+                "Ulcer Index": ("<=", max_ulcer, max_ulcer < max(ulcer_max, 1.0)),
+                "Max Underwater (w)": ("<=", max_underwater, max_underwater < max(uw_max, 1)),
+            }
+
         filters = {
             "min_trades": min_trades,
             "profit_range": profit_range,
@@ -236,6 +294,7 @@ class OptimizationDashboard:
             "largest_loss_range": largest_loss_range,
             "avg_trade_range": avg_trade_range,
             "swaps_range": swaps_range,
+            "trend_filters": trend_filters,
         }
 
         st.sidebar.divider()
@@ -282,6 +341,11 @@ class OptimizationDashboard:
         col3.metric("3. Passed Win Rate:", f"{w_ok}", f"{round(w_ok/max(1,total)*100, 1)}%")
         col4.metric("4. Passed Drawdown:", f"{d_ok}", f"{round(d_ok/max(1,total)*100, 1)}%")
         col5.metric("5. Passed Profit Factor:", f"{pf_ok}", f"{round(pf_ok/max(1,total)*100, 1)}%")
+
+        active_trend = {k: v for k, v in filters.get("trend_filters", {}).items() if v[2] and k in df.columns}
+        if active_trend:
+            trend_ok = int(self.analyzer.trend_mask(df, active_trend).sum())
+            st.metric("6. Passed Trend & Stability:", f"{trend_ok}", f"{round(trend_ok/max(1,total)*100, 1)}%")
 
         st.info("💡 **Tip:** Adjust sliders that result in `0` passing tests to broaden your search space.")
 
@@ -354,7 +418,8 @@ class OptimizationDashboard:
 
         col_cfg1, col_cfg2 = st.columns(2)
         target_metric = col_cfg1.selectbox(
-            "Define 'Best Strategies' by:", ["Net Profit", "Win Rate", "Profit Factor"]
+            "Define 'Best Strategies' by:",
+            ["Net Profit", "Win Rate", "Profit Factor"] + (["Trend R²"] if "Trend R²" in filtered_df.columns else [])
         )
         elite_pct = col_cfg2.slider("Elite Cluster Size (Top %):", min_value=10, max_value=50, value=25, step=5) / 100.0
 
@@ -476,6 +541,180 @@ class OptimizationDashboard:
                 file_name=f"cTrader_time_series_{freq_label.lower()}.csv", mime="text/csv",
             )
 
+    # ==========================================
+    # SAVED FILTER SETS
+    # ==========================================
+    def _saved_sets_file(self):
+        """Cloud sessions keep their saved sets next to the session's Parquet cache."""
+        session_id = st.query_params.get("session_id")
+        if self.run_mode == "cloud" and session_id:
+            return Path(f"/tmp/ctrader_opt_{session_id}_sets.json")
+        return None
+
+    def _get_saved_sets(self) -> Dict[str, Any]:
+        if "saved_sets" not in st.session_state:
+            sets = {}
+            sets_file = self._saved_sets_file()
+            if sets_file and sets_file.exists():
+                try:
+                    sets = json.loads(sets_file.read_text())
+                except Exception:
+                    sets = {}
+            st.session_state["saved_sets"] = sets
+        return st.session_state["saved_sets"]
+
+    def _persist_saved_sets(self):
+        sets_file = self._saved_sets_file()
+        if sets_file:
+            try:
+                sets_file.write_text(json.dumps(st.session_state["saved_sets"]))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _rgba(hex_color: str, alpha: float) -> str:
+        h = hex_color.lstrip("#")
+        return f"rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {alpha})"
+
+    @st.fragment
+    def _render_trend_volatility(self, filtered_df: pd.DataFrame, full_df: pd.DataFrame):
+        st.divider()
+        st.subheader("7. 📈 Trend & Volatility Comparison")
+        st.write(
+            "Average balance curve of the filtered strategies with a ±1 std band and the min/max envelope, "
+            "the drawdown (underwater) curve below it, and a side-by-side comparison with your saved filter sets."
+        )
+
+        if "Trend R²" not in filtered_df.columns:
+            st.info("ℹ️ No time-series data in the loaded dataset. Use **Rescan / Clear Cache** (or start a new session) to rebuild it.")
+            return
+
+        mode_names = {"all": "All", "long": "Long", "short": "Short"}
+        sets = self._get_saved_sets()
+
+        # --- Save / delete sets ---
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            set_name = st.text_input("Set name", placeholder=f"Set {len(sets) + 1}", key="tv_set_name")
+            save_clicked = st.button("💾 Save current filtered set", disabled=len(sets) >= MAX_SAVED_SETS)
+        if save_clicked:
+            name = set_name.strip() or f"Set {len(sets) + 1}"
+            sets[name] = {
+                "test_ids": [int(t) for t in filtered_df["Test_ID"]],
+                "mode": self.mode,
+                "created": time.strftime("%Y-%m-%d %H:%M"),
+            }
+            self._persist_saved_sets()
+            st.session_state["tv_compare"] = [*st.session_state.get("tv_compare", []), name]
+            st.toast(f"Saved '{name}' with {len(filtered_df)} strategies.")
+        if len(sets) >= MAX_SAVED_SETS:
+            st.caption(f"⚠️ Maximum {MAX_SAVED_SETS} saved sets. Delete one to save a new set.")
+
+        compare = []
+        if sets:
+            st.session_state["tv_compare"] = [n for n in st.session_state.get("tv_compare", list(sets)) if n in sets]
+            compare = st.pills(
+                "Compare with saved sets", list(sets), selection_mode="multi", key="tv_compare",
+                format_func=lambda n: f"{n} ({len(sets[n]['test_ids'])}, saved in {mode_names.get(sets[n]['mode'], '?')})",
+            ) or []
+            with st.container(horizontal=True, vertical_alignment="bottom"):
+                to_delete = st.selectbox("Saved set", list(sets), key="tv_delete_name", label_visibility="collapsed")
+                if st.button("🗑️ Delete set"):
+                    sets.pop(to_delete, None)
+                    self._persist_saved_sets()
+                    st.rerun(scope="fragment")
+
+        # --- Chart options ---
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            scale = st.segmented_control("Scale", ["Absolute", "ROI %"], default="Absolute", key="tv_scale") or "Absolute"
+            spaghetti = st.toggle("Show individual curves", key="tv_spaghetti", help="Top strategies of the current filter as faint lines.")
+            if spaghetti:
+                top_n = st.number_input("Top N", min_value=1, max_value=50, value=20, key="tv_top_n")
+                rank_by = st.selectbox("Rank by", ["Net Profit", "Trend R²"], key="tv_rank_by")
+        roi = scale == "ROI %"
+
+        groups = [("Current filter", filtered_df)]
+        for name in compare:
+            groups.append((name, full_df[full_df["Test_ID"].isin(sets[name]["test_ids"])]))
+
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, row_heights=[0.68, 0.32], vertical_spacing=0.06,
+            subplot_titles=("Balance curve" + (" (ROI %)" if roi else ""), "Drawdown from peak (%)"),
+        )
+        summary = []
+        for idx, (name, group_df) in enumerate(groups):
+            if group_df.empty or group_df["PnL_Series"].isna().all():
+                continue
+            color = SET_COLORS[idx % len(SET_COLORS)]
+            curves = _cached_set_curves(group_df[["Test_ID", "PnL_Series"]], self.mode, roi)
+            eq, dd = curves["equity_stats"], curves["drawdown_stats"]
+            if eq.empty:
+                continue
+            x = eq["period_start"]
+            many = len(group_df) > 1
+
+            if idx == 0 and spaghetti:
+                top_ids = group_df.nlargest(int(top_n), rank_by)["Test_ID"]
+                for test_id in [t for t in top_ids if t in curves["equity"].columns]:
+                    line = curves["equity"][test_id].dropna()
+                    fig.add_trace(go.Scatter(
+                        x=line.index, y=line, mode="lines", line=dict(width=1, color=self._rgba("#9AA0A6", 0.35)),
+                        name=f"Test {test_id}", legendgroup="spaghetti", showlegend=False,
+                        hovertemplate=f"Test {test_id}<br>%{{x|%Y-%m-%d}}: %{{y:.2f}}<extra></extra>",
+                    ), row=1, col=1)
+
+            if many:
+                fig.add_trace(go.Scatter(x=x, y=eq["mean"] + eq["std"], mode="lines", line=dict(width=0),
+                                         legendgroup=name, showlegend=False, hoverinfo="skip"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=x, y=eq["mean"] - eq["std"], mode="lines", line=dict(width=0),
+                                         fill="tonexty", fillcolor=self._rgba(color, 0.18),
+                                         legendgroup=name, showlegend=False, hoverinfo="skip"), row=1, col=1)
+                for col, dash in (("max", "dot"), ("min", "dot")):
+                    fig.add_trace(go.Scatter(x=x, y=eq[col], mode="lines", line=dict(width=1, dash=dash, color=color),
+                                             legendgroup=name, showlegend=False, name=f"{name} {col}",
+                                             hovertemplate=f"{name} {col}: %{{y:.2f}}<extra></extra>"), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=x, y=eq["mean"], mode="lines", line=dict(width=2.5, color=color), name=f"{name} ({len(group_df)})",
+                legendgroup=name, customdata=eq[["std", "n"]].to_numpy(),
+                hovertemplate=f"{name}<br>%{{x|%Y-%m-%d}}<br>Mean: %{{y:.2f}}<br>Std: %{{customdata[0]:.2f}}<br>Tests: %{{customdata[1]}}<extra></extra>",
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(x=dd["period_start"], y=dd["mean"], mode="lines", line=dict(width=2, color=color),
+                                     legendgroup=name, showlegend=False,
+                                     hovertemplate=f"{name} avg DD: %{{y:.2f}}%<extra></extra>"), row=2, col=1)
+            if many:
+                fig.add_trace(go.Scatter(x=dd["period_start"], y=dd["min"], mode="lines",
+                                         line=dict(width=1, dash="dot", color=color), legendgroup=name, showlegend=False,
+                                         hovertemplate=f"{name} worst DD: %{{y:.2f}}%<extra></extra>"), row=2, col=1)
+
+            summary.append({
+                "Set": name,
+                "Tests": len(group_df),
+                "Avg Net Profit": round(group_df["Net Profit"].mean(), 2),
+                "Avg Trend R²": round(group_df["Trend R²"].mean(), 3),
+                "Median Trend R²": round(group_df["Trend R²"].median(), 3),
+                "Avg Ulcer Index": round(group_df["Ulcer Index"].mean(), 3),
+                "Worst DD %": round(dd["min"].min(), 2),
+                "Avg Max Underwater (w)": round(group_df["Max Underwater (w)"].mean(), 1),
+                "Avg Weekly Vol %": round(group_df["Weekly Vol %"].mean(), 3),
+                "Avg Weekly Sharpe": round(group_df["Weekly Sharpe"].mean(), 3),
+            })
+
+        if not summary:
+            st.info("ℹ️ The selected strategies have no time-series data to plot.")
+            return
+
+        fig.update_layout(height=720, hovermode="x unified", legend=dict(orientation="h", y=1.08))
+        fig.update_yaxes(title_text="ROI %" if roi else "Balance", row=1, col=1)
+        fig.update_yaxes(title_text="DD %", row=2, col=1)
+        st.plotly_chart(fig, width="stretch")
+
+        st.markdown("#### 📊 Set comparison")
+        summary_df = pd.DataFrame(summary)
+        st.dataframe(summary_df, hide_index=True, width="stretch")
+        st.download_button(
+            "📥 Download Set Comparison (CSV)", data=summary_df.to_csv(index=False).encode("utf-8"),
+            file_name="cTrader_set_comparison.csv", mime="text/csv",
+        )
+
     def _render_data_table(self, filtered_df: pd.DataFrame):
         st.subheader("4. 📋 Top Strategy Cluster (Data Table)")
         table_df = filtered_df.drop(columns=["PnL_Series"], errors="ignore")
@@ -535,6 +774,7 @@ class OptimizationDashboard:
             self._render_data_table(filtered_df)
             self._render_search_space_pruning(filtered_df)
             self._render_time_series(filtered_df)
+            self._render_trend_volatility(filtered_df, df)
         else:
             self._render_filter_diagnostics(df, filters)
 
