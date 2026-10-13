@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import Dict, Any
 
-from src.scanner import CTraderScanner
+from src.scanner import CTraderScanner, DURATION_METRICS
 from src.analyzer import StrategyAnalyzer
 from src.timeseries import TimeSeriesAnalyzer
 
@@ -22,8 +22,8 @@ def _cached_time_series(series_df: pd.DataFrame, mode: str, freq: str, cumulativ
 
 
 @st.cache_data(max_entries=16, show_spinner=False)
-def _cached_month_heatmap(series_df: pd.DataFrame, mode: str, metric: str):
-    return TimeSeriesAnalyzer.month_heatmap(TimeSeriesAnalyzer.expand(series_df, mode), metric)
+def _cached_seasonality_heatmap(series_df: pd.DataFrame, mode: str, metric: str, granularity: str):
+    return TimeSeriesAnalyzer.seasonality_heatmap(TimeSeriesAnalyzer.expand(series_df, mode), metric, granularity)
 
 
 @st.cache_data(max_entries=8, show_spinner=False)
@@ -93,6 +93,27 @@ class OptimizationDashboard:
         if s_min >= s_max:
             s_max = s_min + 1.0
         return st.sidebar.slider(label, min_value=s_min, max_value=s_max, value=(s_min, s_max), step=step)
+
+    @staticmethod
+    def _log_steps(series: pd.Series, count: int = 60) -> list:
+        """Log-spaced, rounded slider steps covering the series' range (for heavily skewed metrics)."""
+        values = series.dropna()
+        values = values[values > 0]
+        if values.empty:
+            return [0.0, 1.0]
+        low, high = float(values.min()), float(values.max())
+        if high <= low:
+            return [round(low, 4), round(low, 4) + 1.0]
+        def round_sig(value: float, direction) -> float:
+            # Rounds to 3 significant digits, downwards for the minimum and upwards for the maximum.
+            scale = 10 ** (np.floor(np.log10(value)) - 2)
+            return float(f"{direction(value / scale) * scale:.3g}")
+
+        steps = np.geomspace(low, high, count)
+        rounded = sorted({float(f"{v:.3g}") for v in steps[1:-1]} | {round_sig(low, np.floor), round_sig(high, np.ceil)})
+        if 0 < (series.dropna() <= 0).sum():
+            rounded = [0.0] + rounded
+        return rounded
 
     def _render_sidebar(self) -> tuple:
         st.sidebar.header("📁 Data Source")
@@ -214,7 +235,8 @@ class OptimizationDashboard:
         for col in [
             "Net Profit", "Profit Factor", "Swaps", "Total Trades", 
             "Winning Trades", "Losing Trades", "Max Cons. Losses", 
-            "Largest Win", "Largest Loss", "Average Trade", "Win Rate"
+            "Largest Win", "Largest Loss", "Average Trade", "Win Rate",
+            *DURATION_METRICS,
         ]:
             col_name = f"{col}_{mode}"
             if col_name in active_df.columns:
@@ -283,6 +305,37 @@ class OptimizationDashboard:
                 "Max Underwater (w)": ("<=", max_underwater, max_underwater < max(uw_max, 1)),
             }
 
+        # --- 6. POSITION DURATION FILTERS ---
+        duration_filters = {}
+        if "Avg Bars Held" in active_df.columns and active_df["Avg Bars Held"].notna().any():
+            st.sidebar.divider()
+            st.sidebar.header("⏱️ Position Duration")
+            if active_df["Timeframe"].nunique() > 1:
+                st.sidebar.warning("Mixed timeframes: candle counts are not comparable across tests.")
+            duration_metric = st.sidebar.selectbox(
+                "Filter on (bars held per test)", ["Average", "Median", "P90"],
+                help="Holding time of the positions divided by the candle size of the report's timeframe.",
+            )
+            duration_col = {"Average": "Avg Bars Held", "Median": "Median Bars Held", "P90": "P90 Bars Held"}[duration_metric]
+            steps = self._log_steps(active_df[duration_col])
+            bars_range = st.sidebar.select_slider(
+                f"{duration_metric} bars held (min / max)", options=steps, value=(steps[0], steps[-1]),
+                help="Log-scaled steps, so short and long holding times can both be set precisely.",
+            )
+            cap_steps = self._log_steps(active_df["Max Bars Held"])
+            max_bars_cap = st.sidebar.select_slider(
+                "Max single position (bars)", options=cap_steps, value=cap_steps[-1],
+                help="Excludes tests that held any single position longer than this.",
+            )
+            duration_filters = {
+                duration_col: ("between", bars_range, bars_range != (steps[0], steps[-1])),
+                "Max Bars Held": ("<=", max_bars_cap, max_bars_cap != cap_steps[-1]),
+            }
+            if any(v[2] for v in duration_filters.values()):
+                missing = int(active_df[duration_col].isna().sum())
+                if missing:
+                    st.sidebar.caption(f"ℹ️ {missing} tests without candle-based duration (e.g. tick/Renko) are excluded.")
+
         filters = {
             "min_trades": min_trades,
             "profit_range": profit_range,
@@ -295,6 +348,7 @@ class OptimizationDashboard:
             "avg_trade_range": avg_trade_range,
             "swaps_range": swaps_range,
             "trend_filters": trend_filters,
+            "duration_filters": duration_filters,
         }
 
         st.sidebar.divider()
@@ -346,6 +400,11 @@ class OptimizationDashboard:
         if active_trend:
             trend_ok = int(self.analyzer.trend_mask(df, active_trend).sum())
             st.metric("6. Passed Trend & Stability:", f"{trend_ok}", f"{round(trend_ok/max(1,total)*100, 1)}%")
+
+        active_duration = {k: v for k, v in filters.get("duration_filters", {}).items() if v[2] and k in df.columns}
+        if active_duration:
+            duration_ok = int(self.analyzer.trend_mask(df, active_duration).sum())
+            st.metric("7. Passed Position Duration:", f"{duration_ok}", f"{round(duration_ok/max(1,total)*100, 1)}%")
 
         st.info("💡 **Tip:** Adjust sliders that result in `0` passing tests to broaden your search space.")
 
@@ -509,19 +568,28 @@ class OptimizationDashboard:
         )
         st.plotly_chart(fig, width="stretch")
 
-        st.markdown("#### 🗓️ Seasonality heatmap (year × month)")
-        heat_metric = st.segmented_control(
-            "Heatmap metric", ["Average profit", "Losing tests (%)"], default="Average profit", key="ts_heat_metric"
-        ) or "Average profit"
+        st.markdown("#### 🗓️ Seasonality heatmap")
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            heat_granularity = st.segmented_control(
+                "Heatmap columns", ["Months", "Weeks"], default="Months", key="ts_heat_granularity"
+            ) or "Months"
+            heat_metric = st.segmented_control(
+                "Heatmap metric", ["Average profit", "Losing tests (%)"], default="Average profit", key="ts_heat_metric"
+            ) or "Average profit"
         is_profit = heat_metric == "Average profit"
-        matrix = _cached_month_heatmap(series_df, self.mode, "mean_profit" if is_profit else "loss_ratio")
+        weekly = heat_granularity == "Weeks"
+        matrix = _cached_seasonality_heatmap(
+            series_df, self.mode, "mean_profit" if is_profit else "loss_ratio", "W" if weekly else "M"
+        )
         if matrix is not None and not matrix.empty:
             fig_heat = px.imshow(
-                matrix, text_auto=".0f" if not is_profit else ".1f", aspect="auto",
+                matrix, text_auto=False if weekly else (".1f" if is_profit else ".0f"), aspect="auto",
                 color_continuous_scale="RdYlGn" if is_profit else "Reds",
                 color_continuous_midpoint=0 if is_profit else None,
-                labels=dict(x="Month", y="Year", color="Avg profit" if is_profit else "Losing tests %"),
+                labels=dict(x="ISO week" if weekly else "Month", y="Year", color="Avg profit" if is_profit else "Losing tests %"),
             )
+            if weekly:
+                fig_heat.update_traces(hovertemplate="%{y} %{x}<br>%{z:.2f}<extra></extra>")
             st.plotly_chart(fig_heat, width="stretch")
 
         if not cumulative:
@@ -629,7 +697,7 @@ class OptimizationDashboard:
             spaghetti = st.toggle("Show individual curves", key="tv_spaghetti", help="Top strategies of the current filter as faint lines.")
             if spaghetti:
                 top_n = st.number_input("Top N", min_value=1, max_value=50, value=20, key="tv_top_n")
-                rank_by = st.selectbox("Rank by", ["Net Profit", "Trend R²"], key="tv_rank_by")
+                rank_by = st.selectbox("Rank by", ["Net Profit", "Trend R²", "Win Rate"], key="tv_rank_by")
         roi = scale == "ROI %"
 
         groups = [("Current filter", filtered_df)]
@@ -715,6 +783,107 @@ class OptimizationDashboard:
             file_name="cTrader_set_comparison.csv", mime="text/csv",
         )
 
+    @st.fragment
+    def _render_position_duration(self, filtered_df: pd.DataFrame):
+        st.divider()
+        st.subheader("8. ⏱️ Position Duration (Bars Held)")
+        st.write(
+            "How long the strategies keep their positions open, in candles of the report's timeframe. "
+            "Tests far above the dashed line have an average pulled up by a few very long positions."
+        )
+
+        if "Avg Bars Held" not in filtered_df.columns or filtered_df["Avg Hold Time (h)"].isna().all():
+            st.info("ℹ️ No position duration data in the loaded dataset. Use **Rescan / Clear Cache** (or start a new session) to rebuild it.")
+            return
+
+        has_bars = filtered_df["Avg Bars Held"].notna().any()
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            unit = st.segmented_control(
+                "Unit", ["Candles", "Hours"] if has_bars else ["Hours"],
+                default="Candles" if has_bars else "Hours", key="pd_unit",
+            ) or ("Candles" if has_bars else "Hours")
+            x_metric = st.selectbox("Duration vs. profit metric", ["Average", "Median", "P90", "Max"], key="pd_x_metric")
+
+        names = {"Average": "Avg Bars Held", "Median": "Median Bars Held", "P90": "P90 Bars Held", "Max": "Max Bars Held"}
+        plot_df = filtered_df.copy()
+        if unit == "Hours":
+            # Bars -> hours with each test's own candle length; the average also exists for tick/Renko charts.
+            hours_per_bar = plot_df["Timeframe"].map(lambda p: (CTraderScanner._parse_period_minutes(p) or np.nan) / 60.0)
+            for col in names.values():
+                plot_df[col] = plot_df[col] * hours_per_bar
+            plot_df["Avg Bars Held"] = plot_df["Avg Hold Time (h)"]
+        unit_label = "candles" if unit == "Candles" else "hours"
+        floor = 1e-3  # log axes cannot show 0
+
+        hover = [c for c in ["Test_ID", "P90 Bars Held", "Max Bars Held", "Outlier Trades %", "Total Trades", "Net Profit"]
+                 if c in plot_df.columns] + self.analyzer.get_parameter_columns(plot_df)[:4]
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            scatter_df = plot_df.dropna(subset=["Avg Bars Held", "Median Bars Held"])
+            if not scatter_df.empty:
+                scatter_df = scatter_df.assign(
+                    **{"Median (plot)": scatter_df["Median Bars Held"].clip(lower=floor),
+                       "Average (plot)": scatter_df["Avg Bars Held"].clip(lower=floor)}
+                )
+                fig_skew = px.scatter(
+                    scatter_df, x="Median (plot)", y="Average (plot)", color="Outlier Trades %",
+                    hover_data=hover, log_x=True, log_y=True, color_continuous_scale="OrRd",
+                    labels={"Median (plot)": f"Median ({unit_label})", "Average (plot)": f"Average ({unit_label})"},
+                    title="Average vs. median holding time",
+                )
+                low = float(min(scatter_df["Median (plot)"].min(), scatter_df["Average (plot)"].min()))
+                high = float(max(scatter_df["Median (plot)"].max(), scatter_df["Average (plot)"].max()))
+                fig_skew.add_trace(go.Scatter(x=[low, high], y=[low, high], mode="lines", name="average = median",
+                                              line=dict(dash="dash", color="gray", width=1), hoverinfo="skip"))
+                fig_skew.update_layout(legend=dict(orientation="h", y=-0.2))
+                st.plotly_chart(fig_skew, width="stretch")
+            else:
+                st.info("ℹ️ Median holding time needs a time-based timeframe (not tick/Renko).")
+
+        with col_b:
+            x_col = names[x_metric]
+            profit_df = plot_df.dropna(subset=[x_col])
+            if not profit_df.empty:
+                profit_df = profit_df.assign(**{"Duration (plot)": profit_df[x_col].clip(lower=floor)})
+                fig_profit = px.scatter(
+                    profit_df, x="Duration (plot)", y="Net Profit", color="Equity Drawdown", log_x=True,
+                    hover_data=hover, color_continuous_scale=px.colors.diverging.RdYlGn[::-1],
+                    labels={"Duration (plot)": f"{x_metric} holding time ({unit_label})", "Equity Drawdown": "Drawdown (%)"},
+                    title=f"{x_metric} holding time vs. Net Profit",
+                )
+                st.plotly_chart(fig_profit, width="stretch")
+
+        dist_cols = [c for c in ["Avg Bars Held", "Median Bars Held", "P90 Bars Held", "Max Bars Held"] if plot_df[c].notna().any()]
+        dist_df = plot_df.melt(id_vars=["Test_ID"], value_vars=dist_cols, var_name="Metric", value_name="Duration").dropna()
+        if not dist_df.empty:
+            dist_df["Metric"] = dist_df["Metric"].map({v: k for k, v in names.items()})
+            dist_df["Duration"] = dist_df["Duration"].clip(lower=floor)
+            fig_dist = px.box(
+                dist_df, x="Duration", y="Metric", color="Metric", points="outliers", log_x=True,
+                hover_data=["Test_ID"], labels={"Duration": f"Holding time per test ({unit_label})", "Metric": ""},
+                title="Distribution across tests",
+            )
+            fig_dist.update_layout(showlegend=False)
+            st.plotly_chart(fig_dist, width="stretch")
+
+        st.markdown("#### 🔎 Tests with outlier positions")
+        rank_by = st.segmented_control(
+            "Rank by", ["Skew Ratio", "Max Bars Held", "Outlier Trades %"], default="Skew Ratio", key="pd_rank_by"
+        ) or "Skew Ratio"
+        table_cols = [c for c in [
+            "Test_ID", "Timeframe", "Total Trades", "Avg Bars Held", "Median Bars Held", "P90 Bars Held",
+            "Max Bars Held", "Outlier Trades %", "Skew Ratio", "Avg Hold Time (h)", "Net Profit", "Equity Drawdown",
+        ] if c in filtered_df.columns]
+        outliers = filtered_df.nlargest(10, rank_by)[table_cols].round(3)
+        st.caption("Bar values are in candles. Skew Ratio = average ÷ median; outliers are beyond Q3 + 3 × IQR on the log scale.")
+        st.dataframe(outliers, hide_index=True, width="stretch")
+        st.download_button(
+            "📥 Download Position Duration Stats (CSV)",
+            data=filtered_df[table_cols].to_csv(index=False).encode("utf-8"),
+            file_name="cTrader_position_duration.csv", mime="text/csv",
+        )
+
     def _render_data_table(self, filtered_df: pd.DataFrame):
         st.subheader("4. 📋 Top Strategy Cluster (Data Table)")
         table_df = filtered_df.drop(columns=["PnL_Series"], errors="ignore")
@@ -775,6 +944,7 @@ class OptimizationDashboard:
             self._render_search_space_pruning(filtered_df)
             self._render_time_series(filtered_df)
             self._render_trend_volatility(filtered_df, df)
+            self._render_position_duration(filtered_df)
         else:
             self._render_filter_diagnostics(df, filters)
 

@@ -2,6 +2,7 @@ import os
 import json
 import re
 import zipfile
+import numpy as np
 import pandas as pd
 import gc
 import streamlit as st
@@ -10,9 +11,14 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Union
 
 # Columns a cache file must contain to be reused; older caches trigger a rescan.
-REQUIRED_CACHE_COLUMNS = ("Total Trades_all", "PnL_Series")
+REQUIRED_CACHE_COLUMNS = ("Total Trades_all", "PnL_Series", "Avg Bars Held_all")
 TIMESERIES_FORMAT_VERSION = 1
 DAY_MS = 24 * 3600 * 1000
+
+DURATION_METRICS = [
+    "Avg Bars Held", "Median Bars Held", "P90 Bars Held", "Max Bars Held",
+    "Outlier Trades %", "Skew Ratio", "Avg Hold Time (h)",
+]
 
 
 class CTraderScanner:
@@ -148,9 +154,66 @@ class CTraderScanner:
         }
         return json.dumps(payload, separators=(",", ":"))
 
+    @staticmethod
+    def _parse_period_minutes(period: Optional[str]) -> Optional[float]:
+        """Candle length in minutes for time based timeframes (m5, h1, d1, w1); None for tick/Renko/Range/monthly."""
+        match = re.fullmatch(r"([mhdw])(\d+)", str(period or "").strip().lower())
+        if not match:
+            return None
+        unit_minutes = {"m": 1, "h": 60, "d": 1440, "w": 10080}[match.group(1)]
+        return float(unit_minutes * int(match.group(2)))
+
+    def _extract_duration_logic(self, data: dict) -> Dict[str, Any]:
+        """
+        Position holding time per test and direction, in candles of the report's timeframe
+        (and in hours): average, median, P90, max, share of outlier positions and skew ratio.
+        """
+        period = (data.get("main") or {}).get("period")
+        period_minutes = self._parse_period_minutes(period)
+        metrics: Dict[str, Any] = {"Timeframe": period}
+
+        hold_hours = {"all": [], "long": [], "short": []}
+        for t in (data.get("history") or {}).get("items") or []:
+            entry, close = t.get("entryTime"), t.get("closeTime")
+            if entry is None or close is None:
+                continue
+            hours = max(0.0, (close - entry) / 3_600_000)
+            hold_hours["all"].append(hours)
+            hold_hours["long" if str(t.get("direction", "")).lower() == "buy" else "short"].append(hours)
+
+        for mode, values in hold_hours.items():
+            for name in DURATION_METRICS:
+                metrics[f"{name}_{mode}"] = np.nan
+            if not values:
+                continue
+            hours = np.asarray(values)
+            metrics[f"Avg Hold Time (h)_{mode}"] = round(float(hours.mean()), 4)
+            if period_minutes is None:
+                continue
+
+            bars = hours * 60.0 / period_minutes
+            median, p90 = np.percentile(bars, [50, 90])
+            mean = float(bars.mean())
+            # Holding times are heavily right-skewed (seconds next to days), so the outlier
+            # fence (Q3 + 3 x IQR) is taken on the log scale.
+            log_bars = np.log10(np.maximum(bars, 1e-4))
+            q1, q3 = np.percentile(log_bars, [25, 75])
+            metrics.update({
+                f"Avg Bars Held_{mode}": round(mean, 4),
+                f"Median Bars Held_{mode}": round(float(median), 4),
+                f"P90 Bars Held_{mode}": round(float(p90), 4),
+                f"Max Bars Held_{mode}": round(float(bars.max()), 4),
+                f"Outlier Trades %_{mode}": round(float((log_bars > q3 + 3 * (q3 - q1)).mean() * 100), 2),
+                f"Skew Ratio_{mode}": round(mean / max(float(median), 0.01), 2),
+            })
+        return metrics
+
     def _extract_report_logic(self, html: str) -> Dict[str, Any]:
         """Extracts and parses the pure JSON block from the HTML text."""
-        row_metrics = {"Equity Drawdown": 0.0, "PnL_Series": None}
+        row_metrics = {"Equity Drawdown": 0.0, "PnL_Series": None, "Timeframe": None}
+        for mode in ["all", "long", "short"]:
+            for name in DURATION_METRICS:
+                row_metrics[f"{name}_{mode}"] = np.nan
 
         for mode in ["all", "long", "short"]:
             for col in [
@@ -230,6 +293,11 @@ class CTraderScanner:
                 row_metrics["PnL_Series"] = self._extract_timeseries_logic(data)
             except Exception:
                 row_metrics["PnL_Series"] = None
+
+            try:
+                row_metrics.update(self._extract_duration_logic(data))
+            except Exception:
+                pass
 
         except Exception:
             pass
@@ -384,7 +452,7 @@ class CTraderScanner:
         df = pd.DataFrame(results).sort_values(by="Test_ID")
         
         # Modern Pandas dtype conversion replacing the deprecated errors='ignore'
-        text_columns = {"Test_ID", "PnL_Series"}
+        text_columns = {"Test_ID", "PnL_Series", "Timeframe"}
         for col in df.columns:
             if col not in text_columns:
                 try:

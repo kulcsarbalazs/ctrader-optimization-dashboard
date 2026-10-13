@@ -136,22 +136,38 @@ class TimeSeriesAnalyzer:
         return stats.reset_index()
 
     @staticmethod
-    def month_heatmap(long_df: pd.DataFrame, metric: str = "mean_profit") -> Optional[pd.DataFrame]:
-        """Year x month matrix of the average monthly profit or the share of losing tests (%)."""
-        per_test = TimeSeriesAnalyzer.per_test_periods(long_df, "M")
+    def seasonality_heatmap(long_df: pd.DataFrame, metric: str = "mean_profit", granularity: str = "M") -> Optional[pd.DataFrame]:
+        """
+        Year x month (granularity "M") or year x ISO week ("W") matrix of the average
+        period profit or the share of losing tests (%).
+        """
+        per_test = TimeSeriesAnalyzer.per_test_periods(long_df, granularity)
         if per_test.empty:
             return None
 
-        per_test["Year"] = per_test["period_start"].dt.year
-        per_test["Month"] = per_test["period_start"].dt.month
+        if granularity == "W":
+            iso = per_test["period_start"].dt.isocalendar()
+            per_test["Year"], per_test["Slot"] = iso["year"].astype(int), iso["week"].astype(int)
+            slots, labels = range(1, 54), [f"W{w:02d}" for w in range(1, 54)]
+        else:
+            per_test["Year"], per_test["Slot"] = per_test["period_start"].dt.year, per_test["period_start"].dt.month
+            slots, labels = range(1, 13), MONTH_LABELS
+
         per_test["is_loss"] = per_test["net"] < 0
-        grouped = per_test.groupby(["Year", "Month"])
+        grouped = per_test.groupby(["Year", "Slot"])
         values = grouped["net"].mean() if metric == "mean_profit" else grouped["is_loss"].mean() * 100
 
-        matrix = values.unstack("Month").reindex(columns=range(1, 13))
-        matrix.columns = MONTH_LABELS
+        matrix = values.unstack("Slot").reindex(columns=slots)
+        matrix.columns = labels
+        if granularity == "W" and matrix["W53"].isna().all():
+            matrix = matrix.drop(columns="W53")
         matrix.index = matrix.index.astype(str)
         return matrix
+
+    @staticmethod
+    def month_heatmap(long_df: pd.DataFrame, metric: str = "mean_profit") -> Optional[pd.DataFrame]:
+        """Year x month matrix of the average monthly profit or the share of losing tests (%)."""
+        return TimeSeriesAnalyzer.seasonality_heatmap(long_df, metric, "M")
 
     # ==========================================
     # BALANCE CURVES, DRAWDOWNS & TREND METRICS
