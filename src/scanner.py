@@ -6,7 +6,14 @@ import pandas as pd
 import gc
 import streamlit as st
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Union
+
+# Columns a cache file must contain to be reused; older caches trigger a rescan.
+REQUIRED_CACHE_COLUMNS = ("Total Trades_all", "PnL_Series")
+TIMESERIES_FORMAT_VERSION = 1
+DAY_MS = 24 * 3600 * 1000
+
 
 class CTraderScanner:
     """
@@ -26,6 +33,11 @@ class CTraderScanner:
     # ==========================================
     # COMMON INTERFACE (ROUTER)
     # ==========================================
+    @staticmethod
+    def is_cache_compatible(df: Optional[pd.DataFrame]) -> bool:
+        """True if a cached DataFrame has every column the current version needs."""
+        return df is not None and not df.empty and all(c in df.columns for c in REQUIRED_CACHE_COLUMNS)
+
     def get_data(self, force_rescan: bool = False, progress_callback=None) -> Optional[pd.DataFrame]:
         """Manages caching in local mode and starts scanning."""
         if self.env_mode == "cloud":
@@ -35,14 +47,14 @@ class CTraderScanner:
             if self.cache_parquet.exists():
                 try:
                     df = pd.read_parquet(self.cache_parquet)
-                    if not df.empty and "Total Trades_all" in df.columns:
+                    if self.is_cache_compatible(df):
                         return df
                 except Exception:
                     pass
             if self.cache_csv.exists():
                 try:
                     df = pd.read_csv(self.cache_csv)
-                    if not df.empty and "Total Trades_all" in df.columns:
+                    if self.is_cache_compatible(df):
                         return df
                 except Exception:
                     pass
@@ -75,9 +87,70 @@ class CTraderScanner:
             params[k] = v 
         return params
 
+    def _extract_timeseries_logic(self, data: dict) -> Optional[str]:
+        """
+        Builds a compact daily P/L series from the closed trades (history.items) and the
+        equity points of an already parsed report. Days are UTC calendar days.
+        Format: {"v", "start", "end", "cap", "d": [[day_idx, net_all, net_long, net_short, trades, min_eq]]}
+        Only active days are stored; weekly / monthly / yearly periods are aggregated from them
+        and the inactive periods are zero-filled when the series is expanded.
+        """
+        trades = (data.get("history") or {}).get("items") or []
+        points = (data.get("equity") or {}).get("points") or []
+        main = data.get("main") or {}
+        period = main.get("testingPeriod") or {}
+
+        stamps = [t.get("closeTime") for t in trades if t.get("closeTime")]
+        start_ms = period.get("startDate") or (min(stamps) if stamps else None)
+        end_ms = period.get("endDate") or (max(stamps) if stamps else None)
+        if start_ms is None or end_ms is None:
+            return None
+
+        start_day = int(start_ms // DAY_MS)
+        days: Dict[int, list] = {}
+
+        def bucket(ts_ms: float) -> list:
+            idx = max(0, int(ts_ms // DAY_MS) - start_day)
+            return days.setdefault(idx, [idx, 0.0, 0.0, 0.0, 0, None])
+
+        for t in trades:
+            close_time = t.get("closeTime")
+            if not close_time:
+                continue
+            net = float(t.get("net") or 0.0)
+            row = bucket(close_time)
+            row[1] += net
+            if str(t.get("direction", "")).lower() == "buy":
+                row[2] += net
+            else:
+                row[3] += net
+            row[4] += 1
+
+        for p in points:
+            ts, min_eq = p.get("timestamp"), p.get("minEquity")
+            if ts is None or min_eq is None:
+                continue
+            row = bucket(ts)
+            row[5] = float(min_eq) if row[5] is None else min(row[5], float(min_eq))
+
+        def iso_day(day: int) -> str:
+            return datetime.fromtimestamp(day * DAY_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+        payload = {
+            "v": TIMESERIES_FORMAT_VERSION,
+            "start": iso_day(start_day),
+            "end": iso_day(int(end_ms // DAY_MS)),
+            "cap": main.get("startingCapital"),
+            "d": [
+                [r[0], round(r[1], 2), round(r[2], 2), round(r[3], 2), r[4], None if r[5] is None else round(r[5], 2)]
+                for r in (days[i] for i in sorted(days))
+            ],
+        }
+        return json.dumps(payload, separators=(",", ":"))
+
     def _extract_report_logic(self, html: str) -> Dict[str, Any]:
         """Extracts and parses the pure JSON block from the HTML text."""
-        row_metrics = {"Equity Drawdown": 0.0}
+        row_metrics = {"Equity Drawdown": 0.0, "PnL_Series": None}
 
         for mode in ["all", "long", "short"]:
             for col in [
@@ -152,6 +225,11 @@ class CTraderScanner:
                 tot = row_metrics[f"Total Trades_{mode}"]
                 win = row_metrics[f"Winning Trades_{mode}"]
                 row_metrics[f"Win Rate_{mode}"] = round((win / tot) * 100, 2) if tot > 0 else 0.0
+
+            try:
+                row_metrics["PnL_Series"] = self._extract_timeseries_logic(data)
+            except Exception:
+                row_metrics["PnL_Series"] = None
 
         except Exception:
             pass
@@ -306,8 +384,9 @@ class CTraderScanner:
         df = pd.DataFrame(results).sort_values(by="Test_ID")
         
         # Modern Pandas dtype conversion replacing the deprecated errors='ignore'
+        text_columns = {"Test_ID", "PnL_Series"}
         for col in df.columns:
-            if col != "Test_ID":
+            if col not in text_columns:
                 try:
                     df[col] = pd.to_numeric(df[col], errors='raise')
                 except (ValueError, TypeError):

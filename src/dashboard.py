@@ -5,10 +5,22 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from typing import Dict, Any
 
 from src.scanner import CTraderScanner
 from src.analyzer import StrategyAnalyzer
+from src.timeseries import TimeSeriesAnalyzer
+
+
+@st.cache_data(max_entries=16, show_spinner=False)
+def _cached_time_series(series_df: pd.DataFrame, mode: str, freq: str, cumulative: bool) -> pd.DataFrame:
+    return TimeSeriesAnalyzer.aggregate(TimeSeriesAnalyzer.expand(series_df, mode), freq, cumulative)
+
+
+@st.cache_data(max_entries=16, show_spinner=False)
+def _cached_month_heatmap(series_df: pd.DataFrame, mode: str, metric: str):
+    return TimeSeriesAnalyzer.month_heatmap(TimeSeriesAnalyzer.expand(series_df, mode), metric)
 
 class OptimizationDashboard:
     """Controls the entire Streamlit user interface."""
@@ -20,6 +32,7 @@ class OptimizationDashboard:
         self.scanner = None
         self.analyzer = None
         self.run_mode = os.environ.get("ENV_MODE", "local").lower()
+        self.mode = "all"
 
     def _cleanup_old_cache_files(self, max_age_hours: int = 24):
         """
@@ -78,6 +91,12 @@ class OptimizationDashboard:
                     st.session_state["cached_df"] = raw_df
                 else:
                     raw_df = st.session_state["cached_df"]
+
+                if not CTraderScanner.is_cache_compatible(raw_df):
+                    st.sidebar.warning(
+                        "This session was created by an older version. "
+                        "Start a new session and re-upload the ZIP to enable the Time-Series Breakdown."
+                    )
 
                 # Allow user to completely reset their session
                 if st.sidebar.button("🗑️ Start New Session", use_container_width=True):
@@ -159,6 +178,7 @@ class OptimizationDashboard:
             ["📊 Both (All)", "📈 Only Long", "📉 Only Short"],
         )
         mode = "all" if "Both" in mode_label else ("long" if "Long" in mode_label else "short")
+        self.mode = mode
 
         # --- 2. ACTIVE COLUMN MAPPING ---
         active_df = raw_df.copy()
@@ -368,11 +388,100 @@ class OptimizationDashboard:
         )
         st.plotly_chart(fig_box, use_container_width=True)
 
+    @st.fragment
+    def _render_time_series(self, filtered_df: pd.DataFrame):
+        st.divider()
+        st.subheader("6. 📅 Time-Series Breakdown")
+        st.write(
+            "How the filtered strategies performed period by period. "
+            "Wide bands or deep red cells reveal seasonal or regime-specific weaknesses."
+        )
+
+        if "PnL_Series" not in filtered_df.columns or filtered_df["PnL_Series"].isna().all():
+            st.info("ℹ️ No time-series data in the loaded dataset. Use **Rescan / Clear Cache** (or start a new session) to rebuild it.")
+            return
+        if len(filtered_df) < 2:
+            st.info("⚠️ At least 2 filtered strategies are required for this analysis.")
+            return
+
+        series_df = filtered_df[["Test_ID", "PnL_Series"]]
+        freq_labels = {"Weekly": "W", "Monthly": "M", "Yearly": "Y"}
+
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            freq_label = st.segmented_control(
+                "Breakdown", list(freq_labels), default="Monthly", key="ts_freq"
+            ) or "Monthly"
+            cumulative = st.toggle("Cumulative", key="ts_cumulative", help="Show the running total instead of each period's own P/L.")
+
+        stats = _cached_time_series(series_df, self.mode, freq_labels[freq_label], cumulative)
+        if stats.empty:
+            st.info("ℹ️ The filtered strategies have no closed trades to break down.")
+            return
+
+        x = stats["period_start"]
+        upper = stats["mean"] + stats["std"]
+        lower = stats["mean"] - stats["std"]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=upper, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(
+            x=x, y=lower, mode="lines", line=dict(width=0), fill="tonexty",
+            fillcolor="rgba(99, 110, 250, 0.25)", name="± 1 std", hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(x=x, y=stats["max"], mode="lines", name="Max", line=dict(dash="dot", width=1, color="#00CC96")))
+        fig.add_trace(go.Scatter(x=x, y=stats["min"], mode="lines", name="Min", line=dict(dash="dot", width=1, color="#EF553B")))
+        fig.add_trace(go.Scatter(
+            x=x, y=stats["mean"], mode="lines", name="Mean", line=dict(width=2, color="#636EFA"),
+            customdata=stats[["std", "n", "loss_ratio", "median"]].to_numpy(),
+            hovertemplate=(
+                "%{x|%Y-%m-%d}<br>Mean: %{y:.2f}<br>Std: %{customdata[0]:.2f}<br>Median: %{customdata[3]:.2f}"
+                "<br>Losing tests: %{customdata[2]:.1f}%<br>Tests: %{customdata[1]}<extra></extra>"
+            ),
+        ))
+        fig.add_hline(y=0, line_width=1, line_color="gray")
+        fig.update_layout(
+            title=f"{'Cumulative' if cumulative else freq_label} P/L across {len(filtered_df)} strategies (mean ± std, min/max)",
+            xaxis_title="Period", yaxis_title="Net Profit", hovermode="x unified",
+        )
+        st.plotly_chart(fig, width="stretch")
+
+        st.markdown("#### 🗓️ Seasonality heatmap (year × month)")
+        heat_metric = st.segmented_control(
+            "Heatmap metric", ["Average profit", "Losing tests (%)"], default="Average profit", key="ts_heat_metric"
+        ) or "Average profit"
+        is_profit = heat_metric == "Average profit"
+        matrix = _cached_month_heatmap(series_df, self.mode, "mean_profit" if is_profit else "loss_ratio")
+        if matrix is not None and not matrix.empty:
+            fig_heat = px.imshow(
+                matrix, text_auto=".0f" if not is_profit else ".1f", aspect="auto",
+                color_continuous_scale="RdYlGn" if is_profit else "Reds",
+                color_continuous_midpoint=0 if is_profit else None,
+                labels=dict(x="Month", y="Year", color="Avg profit" if is_profit else "Losing tests %"),
+            )
+            st.plotly_chart(fig_heat, width="stretch")
+
+        if not cumulative:
+            st.markdown(f"#### ⚠️ Weakest {freq_label.lower()} periods")
+            st.caption("Periods with the highest share of losing strategies, then the lowest average P/L.")
+            period_format = {"Weekly": "%Y-%m-%d", "Monthly": "%Y-%m", "Yearly": "%Y"}[freq_label]
+            worst = stats.sort_values(["loss_ratio", "mean"], ascending=[False, True]).head(10).copy()
+            worst["period_start"] = worst["period_start"].dt.strftime(period_format)
+            worst = worst[["period_start", "loss_ratio", "mean", "median", "std", "min", "max", "n"]].rename(columns={
+                "period_start": "Period start", "mean": "Mean", "std": "Std", "min": "Min",
+                "max": "Max", "median": "Median", "loss_ratio": "Losing tests (%)", "n": "Tests",
+            }).round(2)
+            st.dataframe(worst, hide_index=True, width="stretch")
+            st.download_button(
+                "📥 Download Period Statistics (CSV)",
+                data=stats.round(4).to_csv(index=False).encode("utf-8"),
+                file_name=f"cTrader_time_series_{freq_label.lower()}.csv", mime="text/csv",
+            )
+
     def _render_data_table(self, filtered_df: pd.DataFrame):
         st.subheader("4. 📋 Top Strategy Cluster (Data Table)")
-        st.dataframe(filtered_df.sort_values(by="Net Profit", ascending=False), use_container_width=True)
+        table_df = filtered_df.drop(columns=["PnL_Series"], errors="ignore")
+        st.dataframe(table_df.sort_values(by="Net Profit", ascending=False), use_container_width=True)
 
-        csv_export = filtered_df.to_csv(index=False).encode("utf-8")
+        csv_export = table_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "📥 Download Filtered List (CSV)", data=csv_export, 
             file_name="sweet_spot_strategies.csv", mime="text/csv"
@@ -425,6 +534,7 @@ class OptimizationDashboard:
             self._render_charts(filtered_df)
             self._render_data_table(filtered_df)
             self._render_search_space_pruning(filtered_df)
+            self._render_time_series(filtered_df)
         else:
             self._render_filter_diagnostics(df, filters)
 

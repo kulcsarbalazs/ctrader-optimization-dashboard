@@ -42,7 +42,8 @@ class StrategyAnalyzer:
         ignore_prefixes = [
             "Test_ID", "Total Trades", "Winning Trades", "Losing Trades", 
             "Profit Factor", "Equity Drawdown", "Net Profit", "Win Rate", 
-            "Swaps", "Max Cons. Losses", "Largest Win", "Largest Loss", "Average Trade"
+            "Swaps", "Max Cons. Losses", "Largest Win", "Largest Loss", "Average Trade",
+            "PnL_Series"
         ]
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 

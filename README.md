@@ -57,6 +57,9 @@ Filter your raw data using strict institutional-grade metrics via the sidebar: M
 
 <img src="assets/data-source.jpg" width="270"> <img src="assets/main-filters.jpg" width="270"> <img src="assets/risk-filters.jpg" width="272">
 
+### 6. Time-Series Breakdown
+See *when* your filtered strategies make or lose money. Every closed trade is bucketed into weekly, monthly or yearly periods, and the dashboard draws the mean P/L across all filtered strategies with a ±1 standard deviation band and the min/max envelope (switchable to a cumulative view). A year × month **seasonality heatmap** shows either the average profit or the share of losing strategies per month, and the weakest periods are listed in a downloadable table, so seasonal or regime-specific vulnerabilities of a parameter set become visible at a glance.
+
 ---
 
 ## 🏗️ Architecture & Cloud Readiness
@@ -107,10 +110,11 @@ We are continuously improving this analyzer to provide institutional-grade tools
 * [x] Lazy Garbage Collection for 1GB RAM limits
 * [x] Machine Learning (Random Forest) Feature Importance
 * [x] Search Space Pruning & Optimization Re-targeting
+* [x] **Time-Series Breakdown:** Weekly, monthly, and yearly performance heatmaps to identify seasonal vulnerabilities in specific parameter sets.
 
 **🚧 In Progress / Upcoming**
 * [ ] **Trend & Volatility Comparison:** Visual comparison of filtered strategies based on balance curves, trend stability, and drawdown excursions.
-* [ ] **Time-Series Breakdown:** Weekly, monthly, and yearly performance heatmaps to identify seasonal vulnerabilities in specific parameter sets.
+* [ ] **Position Duration (Bars Held):** Chart and range filter for the average position length measured in candles (holding time ÷ timeframe), with median, P90 and max values to expose outlier trades that distort the average.
 
 ---
 
