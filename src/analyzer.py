@@ -62,7 +62,7 @@ class StrategyAnalyzer:
             "Test_ID", "Total Trades", "Winning Trades", "Losing Trades", 
             "Profit Factor", "Equity Drawdown", "Net Profit", "Win Rate", 
             "Swaps", "Max Cons. Losses", "Largest Win", "Largest Loss", "Average Trade",
-            "PnL_Series", "Trend R²", "Ulcer Index", "Max Underwater", "Weekly ",
+            "PnL_Series", "Hold_Hist", "Starting Capital", "Trend R²", "Ulcer Index", "Max Underwater", "Weekly ",
             "Avg Bars Held", "Median Bars Held", "P90 Bars Held", "Max Bars Held",
             "Outlier Trades", "Skew Ratio", "Avg Hold Time"
         ]

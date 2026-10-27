@@ -58,13 +58,24 @@ Filter your raw data using strict institutional-grade metrics via the sidebar: M
 <img src="assets/data-source.jpg" width="270"> <img src="assets/main-filters.jpg" width="270"> <img src="assets/risk-filters.jpg" width="272">
 
 ### 6. Time-Series Breakdown
-See *when* your filtered strategies make or lose money. Every closed trade is bucketed into weekly, monthly or yearly periods, and the dashboard draws the mean P/L across all filtered strategies with a ±1 standard deviation band and the min/max envelope (switchable to a cumulative view). A year × month (or year × ISO week) **seasonality heatmap** shows either the average profit or the share of losing strategies per month, and the weakest periods are listed in a downloadable table, so seasonal or regime-specific vulnerabilities of a parameter set become visible at a glance.
+See *when* your filtered strategies make or lose money. Every closed trade is bucketed into weekly, monthly or yearly periods, and the dashboard draws the mean P/L across all filtered strategies with a ±1 standard deviation band and the min/max envelope (switchable to a cumulative view). A year × month (or year × ISO week) **seasonality heatmap** shows either the average profit or the share of losing strategies per month, and the weakest periods are listed in a downloadable table, so seasonal or regime-specific vulnerabilities of a parameter set become visible at a glance. Below it, the **single test breakdown** shows one selected test week by week, month by month or year by year (net profit, win rate and max drawdown in % and amount; profit and win rate optionally cumulative), followed by its full result sheet and cBot parameters, so there is no need to look the test up in cTrader by its ID.
 
 ### 7. Trend & Volatility Comparison
 Compare *how* strategies make their money, not just how much. The filtered set is drawn as an average balance curve (absolute or ROI %) with a ±1 std band and min/max envelope, with the drawdown-from-peak (underwater) curve on a shared time axis below it; the intraweek equity low is included, so floating losses are not hidden. Every test gets trend metrics: **Trend R²** (steadiness of the balance curve, signed by its direction), **Ulcer Index**, **Max Time Underwater**, weekly volatility and a weekly Sharpe-style ratio. They are available as sidebar filters and as a "Best Strategies" target in Search Space Pruning. Save up to 4 filter states as named sets and overlay them on the same chart with a side-by-side comparison table; optionally show the top N individual curves (ranked by Net Profit, Trend R² or Win Rate) behind the average.
 
 ### 8. Position Duration (Bars Held)
-How long do positions stay open, measured in candles of the report's timeframe (holding time ÷ candle size, or in hours)? Averages are easily distorted by a handful of positions left open for days, so every test also gets the median, P90 and longest position, the share of outlier positions and a skew ratio (average ÷ median). The sidebar gets a min/max range filter on the average, median or P90 bars held (log-scaled steps) plus a cap on the longest single position, and the charts show average vs. median, holding time vs. Net Profit, the distribution across tests and the tests with the most extreme positions.
+How long do positions stay open, measured in candles of the report's timeframe (holding time ÷ candle size, or in hours)? Averages are easily distorted by a handful of positions left open for days, so every test also gets the median, P90 and longest position, the share of outlier positions and a skew ratio (average ÷ median). The sidebar gets a min/max range filter on the average, median or P90 bars held (log-scaled steps) plus a cap on the longest single position, and the charts show average vs. median, holding time vs. Net Profit, the distribution across tests and the tests with the most extreme positions. Click a test in the outlier table (or pick one) to see the holding time histogram of its individual positions with the average, median, P90 and max marked.
+
+---
+
+### Layout: list or tabs
+A switch above the sections shows them either as one long list (use this to export the full report as a full-page screenshot or PDF) or as tabs, where only the open tab is computed.
+
+### Drawdown in % or amount
+Like the Long / Short switch, a global sidebar switch shows every drawdown either as a percentage of the peak balance or as an amount in account currency: the Max Equity Drawdown filter, chart colors, the drawdown curves and the result sheet all follow it, and tooltips show the other unit as well.
+
+### Starting capital
+Balance curves, ROI and drawdown percentages use each test's real starting capital: it is read from the optimization's own settings (the `<Name>.optres` file cTrader saves next to the `<Name>/` results folder), falling back to the value in the backtest report. Tests without a known starting capital are left out of the capital-based charts instead of assuming a default.
 
 ---
 

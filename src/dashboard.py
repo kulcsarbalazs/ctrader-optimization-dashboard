@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import Dict, Any
 
-from src.scanner import CTraderScanner, DURATION_METRICS
+from src.scanner import CTraderScanner, DURATION_METRICS, HOLD_HIST_BINS
 from src.analyzer import StrategyAnalyzer
 from src.timeseries import TimeSeriesAnalyzer
 
@@ -34,15 +34,61 @@ def _cached_trend_metrics(series_df: pd.DataFrame, mode: str) -> pd.DataFrame:
 
 
 @st.cache_data(max_entries=24, show_spinner=False)
-def _cached_set_curves(series_df: pd.DataFrame, mode: str, roi: bool) -> Dict[str, pd.DataFrame]:
+def _cached_set_curves(series_df: pd.DataFrame, mode: str, roi: bool, dd_absolute: bool = False) -> Dict[str, pd.DataFrame]:
     mats = TimeSeriesAnalyzer.weekly_matrices(TimeSeriesAnalyzer.expand(series_df, mode))
     equity = TimeSeriesAnalyzer.equity_curves(mats, roi=roi)
-    drawdown = TimeSeriesAnalyzer.drawdown_curves(mats, use_equity=(mode == "all"))
+    drawdown = TimeSeriesAnalyzer.drawdown_curves(mats, use_equity=(mode == "all"), absolute=dd_absolute)
     return {
         "equity": equity,
         "equity_stats": TimeSeriesAnalyzer.band_stats(equity),
         "drawdown_stats": TimeSeriesAnalyzer.band_stats(drawdown),
     }
+
+
+def fmt_number(value: float) -> str:
+    """Short human readable number: more decimals for small values, fewer for large ones."""
+    if value is None or pd.isna(value):
+        return "–"
+    v = abs(float(value))
+    if v >= 1000:
+        return f"{value:,.0f}"
+    if v >= 10:
+        return f"{value:.1f}"
+    if v >= 1:
+        return f"{value:.2f}"
+    return f"{value:.3g}"
+
+
+def fmt_param(value) -> str:
+    """cBot parameter value as entered in cTrader: integers without decimals, floats trimmed."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "–"
+    if isinstance(value, (int, np.integer)) or (isinstance(value, float) and float(value).is_integer()):
+        return str(int(value))
+    return f"{float(value):.6g}"
+
+
+# Columns where cents / hundredths are the meaningful precision.
+TWO_DECIMAL_COLUMNS = {
+    "Net Profit", "Largest Win", "Largest Loss", "Average Trade", "Swaps", "Win Rate",
+    "Equity Drawdown", "Profit Factor", "Skew Ratio",
+}
+
+
+def round_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Copy of df with float columns rounded for chart tooltips: 2 decimals for money and
+    percentage metrics, otherwise 2-4 decimals depending on the column's typical magnitude.
+    """
+    out = df.copy()
+    for col in out.select_dtypes(include=["float"]).columns:
+        if col in TWO_DECIMAL_COLUMNS or col.endswith("%") or "%" in col:
+            decimals = 2
+        else:
+            typical = out[col].abs().median()
+            decimals = 2 if pd.isna(typical) or typical >= 100 else (3 if typical >= 1 else 4)
+        out[col] = out[col].round(decimals)
+    return out
 
 
 TREND_COLUMNS = ["Trend R²", "Ulcer Index", "Max Underwater (w)", "Weekly Vol %", "Weekly Sharpe"]
@@ -61,6 +107,7 @@ class OptimizationDashboard:
         self.analyzer = None
         self.run_mode = os.environ.get("ENV_MODE", "local").lower()
         self.mode = "all"
+        self.dd_amount = False  # show drawdowns as an amount (account currency) instead of %
 
     def _cleanup_old_cache_files(self, max_age_hours: int = 24):
         """
@@ -229,6 +276,12 @@ class OptimizationDashboard:
         )
         mode = "all" if "Both" in mode_label else ("long" if "Long" in mode_label else "short")
         self.mode = mode
+        has_dd_amount = "Equity Drawdown Amount" in raw_df.columns
+        dd_unit = st.sidebar.segmented_control(
+            "Show drawdown as", ["%", "Amount"], default="%", key="dd_unit", disabled=not has_dd_amount,
+            help="Percent of the peak balance, or the amount in account currency. Applies to filters, charts and tables.",
+        ) or "%"
+        self.dd_amount = dd_unit == "Amount" and has_dd_amount
 
         # --- 2. ACTIVE COLUMN MAPPING ---
         active_df = raw_df.copy()
@@ -242,8 +295,13 @@ class OptimizationDashboard:
             if col_name in active_df.columns:
                 active_df[col] = active_df[col_name]
 
+        # "Equity Drawdown" follows the chosen unit; both variants stay available by name.
+        active_df["Equity Drawdown %"] = active_df["Equity Drawdown"]
+        if self.dd_amount:
+            active_df["Equity Drawdown"] = active_df["Equity Drawdown Amount"]
+
         if "PnL_Series" in active_df.columns and active_df["PnL_Series"].notna().any():
-            trend_df = _cached_trend_metrics(active_df[["Test_ID", "PnL_Series"]], mode)
+            trend_df = _cached_trend_metrics(active_df[self._series_columns(active_df)], mode)
             active_df = active_df.drop(columns=TREND_COLUMNS, errors="ignore").merge(trend_df, on="Test_ID", how="left")
 
         self.analyzer = StrategyAnalyzer(active_df)
@@ -261,7 +319,13 @@ class OptimizationDashboard:
 
         profit_range = self._safe_range_slider("Net Profit Range", active_df["Net Profit"])
         winrate_range = st.sidebar.slider("Win Rate (%) Range", 0.0, 100.0, (0.0, 100.0))
-        max_dd = st.sidebar.slider("Max Equity Drawdown (%)", 0.0, 100.0, 100.0)
+        if self.dd_amount:
+            dd_max = float(np.ceil(active_df["Equity Drawdown"].max() or 1.0))
+            dd_step = 10.0 if dd_max > 1000 else 1.0
+            dd_max = float(np.ceil(dd_max / dd_step) * dd_step)
+            max_dd = st.sidebar.slider("Max Equity Drawdown (amount)", 0.0, max(dd_max, 1.0), max(dd_max, 1.0), step=dd_step)
+        else:
+            max_dd = st.sidebar.slider("Max Equity Drawdown (%)", 0.0, 100.0, 100.0)
         pf_range = self._safe_range_slider("Profit Factor Range", active_df["Profit Factor"], step=0.05)
 
         # --- 4. DETAILED RISK FILTERS ---
@@ -367,6 +431,9 @@ class OptimizationDashboard:
 
         return active_df, filters, mode_label
 
+    def _dd_label(self) -> str:
+        return "Drawdown (amount)" if self.dd_amount else "Drawdown (%)"
+
     def _render_metrics(self, total_count: int, filtered_df: pd.DataFrame, mode_label: str):
         st.caption(f"⚡ Active Trading Mode: **{mode_label}**")
         col1, col2, col3 = st.columns(3)
@@ -420,18 +487,19 @@ class OptimizationDashboard:
         st.write("Bubble size represents trade count; color indicates Equity Drawdown. Hover for parameter details!")
 
         param_cols = self.analyzer.get_parameter_columns(filtered_df)
-        base_hover = ["Test_ID", "Profit Factor", "Swaps", "Max Cons. Losses"]
+        base_hover = ["Test_ID", "Profit Factor", "Swaps", "Max Cons. Losses",
+                      "Equity Drawdown Amount" if not self.dd_amount else "Equity Drawdown %"]
         dynamic_params = param_cols[:6]
         
         valid_hover_data = [col for col in (base_hover + dynamic_params) if col in filtered_df.columns]
 
         fig_scatter = px.scatter(
-            filtered_df,
+            round_for_display(filtered_df),
             x="Win Rate", y="Net Profit", color="Equity Drawdown", size="Total Trades",
             hover_data=valid_hover_data,
             color_continuous_scale=px.colors.diverging.RdYlGn[::-1],
             labels={
-                "Win Rate": "Win Rate (%)", "Net Profit": "Net Profit", "Equity Drawdown": "Drawdown (%)",
+                "Win Rate": "Win Rate (%)", "Net Profit": "Net Profit", "Equity Drawdown": self._dd_label(),
             },
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
@@ -499,7 +567,7 @@ class OptimizationDashboard:
         selected_param = st.selectbox("Select parameter to visualize:", param_cols)
 
         threshold = filtered_df[target_metric].quantile(1.0 - elite_pct)
-        plot_df = filtered_df.copy()
+        plot_df = round_for_display(filtered_df)
         plot_df["Cluster"] = plot_df[target_metric].apply(
             lambda x: f"🔥 Elite Top {int(elite_pct*100)}%" if x >= threshold else "❄️ The Rest"
         )
@@ -510,6 +578,7 @@ class OptimizationDashboard:
             labels={"Cluster": "Performance Cluster", selected_param: selected_param},
             title=f"Distribution and Tightness of {selected_param} in Elite Group",
         )
+        fig_box.update_yaxes(hoverformat=".4~g")
         st.plotly_chart(fig_box, use_container_width=True)
 
     @st.fragment
@@ -551,8 +620,10 @@ class OptimizationDashboard:
             x=x, y=lower, mode="lines", line=dict(width=0), fill="tonexty",
             fillcolor="rgba(99, 110, 250, 0.25)", name="± 1 std", hoverinfo="skip",
         ))
-        fig.add_trace(go.Scatter(x=x, y=stats["max"], mode="lines", name="Max", line=dict(dash="dot", width=1, color="#00CC96")))
-        fig.add_trace(go.Scatter(x=x, y=stats["min"], mode="lines", name="Min", line=dict(dash="dot", width=1, color="#EF553B")))
+        fig.add_trace(go.Scatter(x=x, y=stats["max"], mode="lines", name="Max", line=dict(dash="dot", width=1, color="#00CC96"),
+                                 hovertemplate="Max: %{y:.2f}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=x, y=stats["min"], mode="lines", name="Min", line=dict(dash="dot", width=1, color="#EF553B"),
+                                 hovertemplate="Min: %{y:.2f}<extra></extra>"))
         fig.add_trace(go.Scatter(
             x=x, y=stats["mean"], mode="lines", name="Mean", line=dict(width=2, color="#636EFA"),
             customdata=stats[["std", "n", "loss_ratio", "median"]].to_numpy(),
@@ -588,8 +659,10 @@ class OptimizationDashboard:
                 color_continuous_midpoint=0 if is_profit else None,
                 labels=dict(x="ISO week" if weekly else "Month", y="Year", color="Avg profit" if is_profit else "Losing tests %"),
             )
-            if weekly:
-                fig_heat.update_traces(hovertemplate="%{y} %{x}<br>%{z:.2f}<extra></extra>")
+            fig_heat.update_traces(hovertemplate=(
+                "%{y} %{x}<br>Avg profit: %{z:.2f}<extra></extra>" if is_profit
+                else "%{y} %{x}<br>Losing tests: %{z:.1f}%<extra></extra>"
+            ))
             st.plotly_chart(fig_heat, width="stretch")
 
         if not cumulative:
@@ -608,6 +681,147 @@ class OptimizationDashboard:
                 data=stats.round(4).to_csv(index=False).encode("utf-8"),
                 file_name=f"cTrader_time_series_{freq_label.lower()}.csv", mime="text/csv",
             )
+
+        self._render_single_test(filtered_df)
+
+    @staticmethod
+    def _series_columns(df: pd.DataFrame) -> list:
+        """Columns the time-series helpers need (the starting capital only when it was found)."""
+        return ["Test_ID", "PnL_Series"] + (["Starting Capital"] if "Starting Capital" in df.columns else [])
+
+    def _render_single_test(self, filtered_df: pd.DataFrame):
+        """Period by period results of one selected test, followed by its full result sheet."""
+        st.markdown("#### 🔍 Single test breakdown")
+        candidates = filtered_df.dropna(subset=["PnL_Series"]).sort_values("Net Profit", ascending=False)
+        if candidates.empty:
+            return
+
+        options = candidates["Test_ID"].tolist()
+        profits = dict(zip(candidates["Test_ID"], candidates["Net Profit"]))
+        if st.session_state.get("ts_single_test") not in options:
+            st.session_state.pop("ts_single_test", None)
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            test_id = st.selectbox(
+                "Test", options, key="ts_single_test",
+                format_func=lambda t: f"Test {t}  (Net Profit {fmt_number(profits[t])})",
+                help="Ordered by Net Profit. Use the Test ID shown in the tables and tooltips.",
+            )
+            freq_label = st.segmented_control(
+                "Period", ["Weekly", "Monthly", "Yearly"], default="Monthly", key="ts_single_freq"
+            ) or "Monthly"
+            cumulative = st.toggle("Cumulative", key="ts_single_cumulative",
+                                   help="Running totals for P/L and win rate. The drawdown always stays per period.")
+
+        row = candidates[candidates["Test_ID"] == test_id].iloc[0]
+        capital = row.get("Starting Capital", np.nan)
+        periods = TimeSeriesAnalyzer.test_periods(
+            row["PnL_Series"], capital, self.mode, {"Weekly": "W", "Monthly": "M", "Yearly": "Y"}[freq_label], cumulative
+        )
+        if periods.empty:
+            st.info("ℹ️ No time-series data for this test.")
+            return
+
+        has_dd = periods["max_dd"].notna().any()
+        rows = 3 if has_dd else 2
+        fig = make_subplots(
+            rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            row_heights=[0.45, 0.25, 0.30][:rows] if has_dd else [0.6, 0.4],
+            subplot_titles=["Cumulative net profit" if cumulative else "Net profit", "Win rate (%)",
+                            "Max drawdown (amount)" if self.dd_amount else "Max drawdown (%)"][:rows],
+        )
+        x = periods["period_start"]
+        hover_x = {"Weekly": "%{x|%Y-%m-%d}", "Monthly": "%{x|%Y-%m}", "Yearly": "%{x|%Y}"}[freq_label]
+        trade_counts = periods["trades"].fillna(0).to_numpy()
+        if cumulative:
+            fig.add_trace(go.Scatter(x=x, y=periods["net"], mode="lines", line=dict(color="#636EFA", width=2),
+                                     fill="tozeroy", customdata=trade_counts,
+                                     hovertemplate=hover_x + "<br>Net profit: %{y:,.2f}<br>Trades: %{customdata:.0f}<extra></extra>"),
+                          row=1, col=1)
+        else:
+            colors = np.where(periods["net"] >= 0, "#00CC96", "#EF553B")
+            fig.add_trace(go.Bar(x=x, y=periods["net"], marker_color=colors, customdata=trade_counts,
+                                 hovertemplate=hover_x + "<br>Net profit: %{y:,.2f}<br>Trades: %{customdata:.0f}<extra></extra>"),
+                          row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=periods["win_rate"], mode="lines+markers", line=dict(color="#FFA15A"),
+                                 connectgaps=False, customdata=np.c_[periods["wins"].fillna(0), trade_counts],
+                                 hovertemplate=hover_x + "<br>Win rate: %{y:.2f}%<br>Wins: %{customdata[0]:.0f} / %{customdata[1]:.0f}<extra></extra>"),
+                      row=2, col=1)
+        fig.update_yaxes(range=[0, 105], row=2, col=1)
+        if has_dd:
+            dd_values = periods["max_dd_amount"] if self.dd_amount else periods["max_dd"]
+            fig.add_trace(go.Bar(x=x, y=dd_values, marker_color="#AB63FA",
+                                 customdata=np.c_[periods["max_dd"], periods["max_dd_amount"]],
+                                 hovertemplate=hover_x + "<br>Max drawdown: %{customdata[0]:.2f}%"
+                                               "<br>Amount: %{customdata[1]:,.2f}<extra></extra>"),
+                          row=3, col=1)
+        fig.update_layout(height=640 if has_dd else 480, showlegend=False, bargap=0.15,
+                          title=f"Test {test_id} – {freq_label.lower()} results ({self.mode})")
+        st.plotly_chart(fig, width="stretch")
+        if not has_dd:
+            st.caption("ℹ️ Drawdown needs the starting capital, which was not found in the .optres file or the report.")
+
+        self._render_test_details(row, filtered_df)
+
+    # Columns that are results, not cBot parameters.
+    RESULT_PREFIXES = (
+        "Test_ID", "PnL_Series", "Hold_Hist", "Timeframe", "Starting Capital", "Equity Drawdown",
+        "Net Profit", "Profit Factor", "Swaps", "Total Trades", "Winning Trades", "Losing Trades",
+        "Max Cons. Losses", "Largest Win", "Largest Loss", "Average Trade", "Win Rate",
+        *TREND_COLUMNS, *DURATION_METRICS,
+    )
+
+    def _render_test_details(self, row: pd.Series, df: pd.DataFrame):
+        """Result sheet of one test: key metrics, every result value and the cBot parameters."""
+        st.markdown(f"##### 🧾 Test {row['Test_ID']} result sheet")
+        capital = row.get("Starting Capital", np.nan)
+        roi = row["Net Profit"] / capital * 100 if pd.notna(capital) and capital else np.nan
+        with st.container(horizontal=True):
+            st.metric("Net Profit", f"{row['Net Profit']:,.2f}", f"{roi:.2f}% ROI" if pd.notna(roi) else None, border=True)
+            st.metric("Win Rate", f"{row['Win Rate']:.2f}%", border=True)
+            st.metric("Profit Factor", f"{row['Profit Factor']:.2f}", border=True)
+            dd_pct = row.get("Equity Drawdown %", row["Equity Drawdown"])
+            dd_amt = row.get("Equity Drawdown Amount", np.nan)
+            st.metric("Equity Drawdown",
+                      f"{dd_amt:,.2f}" if self.dd_amount and pd.notna(dd_amt) else f"{dd_pct:.2f}%",
+                      (f"{dd_pct:.2f}%" if self.dd_amount else (f"{dd_amt:,.2f}" if pd.notna(dd_amt) else None)),
+                      delta_color="off", border=True)
+            st.metric("Trades", f"{int(row['Total Trades'])}", border=True)
+            if "Trend R²" in row.index and pd.notna(row["Trend R²"]):
+                st.metric("Trend R²", f"{row['Trend R²']:.3f}", border=True)
+
+        result_items = [
+            ("Starting Capital", capital), ("Timeframe", row.get("Timeframe")),
+            ("Net Profit", row["Net Profit"]), ("Profit Factor", row["Profit Factor"]),
+            ("Win Rate (%)", row["Win Rate"]), ("Equity Drawdown (%)", row.get("Equity Drawdown %", row["Equity Drawdown"])),
+            ("Equity Drawdown Amount", row.get("Equity Drawdown Amount", np.nan)),
+            ("Total Trades", row["Total Trades"]), ("Winning Trades", row.get("Winning Trades")),
+            ("Losing Trades", row.get("Losing Trades")), ("Max Cons. Losses", row["Max Cons. Losses"]),
+            ("Largest Win", row["Largest Win"]), ("Largest Loss", row["Largest Loss"]),
+            ("Average Trade", row["Average Trade"]), ("Swaps", row["Swaps"]),
+            *[(c, row[c]) for c in TREND_COLUMNS if c in row.index],
+            *[(c, row[c]) for c in DURATION_METRICS if c in row.index],
+        ]
+        counts = {"Total Trades", "Winning Trades", "Losing Trades", "Max Cons. Losses", "Max Underwater (w)"}
+        two_decimals = {"Starting Capital", "Net Profit", "Profit Factor", "Win Rate (%)", "Equity Drawdown (%)", "Equity Drawdown Amount",
+                        "Largest Win", "Largest Loss", "Average Trade", "Swaps", "Outlier Trades %", "Skew Ratio"}
+
+        def fmt_result(key, value):
+            if isinstance(value, str) or value is None or pd.isna(value):
+                return value if isinstance(value, str) else "–"
+            if key in counts:
+                return f"{int(value)}"
+            if key in two_decimals:
+                return f"{value:,.2f}"
+            return f"{value:.4g}"
+
+        results = pd.DataFrame([(k, fmt_result(k, v)) for k, v in result_items], columns=["Result", "Value"])
+        param_cols = [c for c in df.columns if not any(c.startswith(p) for p in self.RESULT_PREFIXES)]
+        params = pd.DataFrame(
+            [(c, row[c] if isinstance(row[c], str) else (fmt_param(row[c]))) for c in param_cols], columns=["Parameter", "Value"]
+        )
+        col_a, col_b = st.columns(2)
+        col_a.dataframe(results, hide_index=True, width="stretch")
+        col_b.dataframe(params, hide_index=True, width="stretch")
 
     # ==========================================
     # SAVED FILTER SETS
@@ -706,14 +920,16 @@ class OptimizationDashboard:
 
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, row_heights=[0.68, 0.32], vertical_spacing=0.06,
-            subplot_titles=("Balance curve" + (" (ROI %)" if roi else ""), "Drawdown from peak (%)"),
+            subplot_titles=("Balance curve" + (" (ROI %)" if roi else ""),
+                            "Drawdown from peak (amount)" if self.dd_amount else "Drawdown from peak (%)"),
         )
+        dd_suffix = "" if self.dd_amount else "%"
         summary = []
         for idx, (name, group_df) in enumerate(groups):
             if group_df.empty or group_df["PnL_Series"].isna().all():
                 continue
             color = SET_COLORS[idx % len(SET_COLORS)]
-            curves = _cached_set_curves(group_df[["Test_ID", "PnL_Series"]], self.mode, roi)
+            curves = _cached_set_curves(group_df[self._series_columns(group_df)], self.mode, roi, self.dd_amount)
             eq, dd = curves["equity_stats"], curves["drawdown_stats"]
             if eq.empty:
                 continue
@@ -747,11 +963,11 @@ class OptimizationDashboard:
             ), row=1, col=1)
             fig.add_trace(go.Scatter(x=dd["period_start"], y=dd["mean"], mode="lines", line=dict(width=2, color=color),
                                      legendgroup=name, showlegend=False,
-                                     hovertemplate=f"{name} avg DD: %{{y:.2f}}%<extra></extra>"), row=2, col=1)
+                                     hovertemplate=f"{name} avg DD: %{{y:,.2f}}{dd_suffix}<extra></extra>"), row=2, col=1)
             if many:
                 fig.add_trace(go.Scatter(x=dd["period_start"], y=dd["min"], mode="lines",
                                          line=dict(width=1, dash="dot", color=color), legendgroup=name, showlegend=False,
-                                         hovertemplate=f"{name} worst DD: %{{y:.2f}}%<extra></extra>"), row=2, col=1)
+                                         hovertemplate=f"{name} worst DD: %{{y:,.2f}}{dd_suffix}<extra></extra>"), row=2, col=1)
 
             summary.append({
                 "Set": name,
@@ -760,7 +976,7 @@ class OptimizationDashboard:
                 "Avg Trend R²": round(group_df["Trend R²"].mean(), 3),
                 "Median Trend R²": round(group_df["Trend R²"].median(), 3),
                 "Avg Ulcer Index": round(group_df["Ulcer Index"].mean(), 3),
-                "Worst DD %": round(dd["min"].min(), 2),
+                ("Worst DD (amount)" if self.dd_amount else "Worst DD %"): round(dd["min"].min(), 2),
                 "Avg Max Underwater (w)": round(group_df["Max Underwater (w)"].mean(), 1),
                 "Avg Weekly Vol %": round(group_df["Weekly Vol %"].mean(), 3),
                 "Avg Weekly Sharpe": round(group_df["Weekly Sharpe"].mean(), 3),
@@ -772,7 +988,7 @@ class OptimizationDashboard:
 
         fig.update_layout(height=720, hovermode="x unified", legend=dict(orientation="h", y=1.08))
         fig.update_yaxes(title_text="ROI %" if roi else "Balance", row=1, col=1)
-        fig.update_yaxes(title_text="DD %", row=2, col=1)
+        fig.update_yaxes(title_text="DD amount" if self.dd_amount else "DD %", row=2, col=1)
         st.plotly_chart(fig, width="stretch")
 
         st.markdown("#### 📊 Set comparison")
@@ -826,6 +1042,7 @@ class OptimizationDashboard:
                     **{"Median (plot)": scatter_df["Median Bars Held"].clip(lower=floor),
                        "Average (plot)": scatter_df["Avg Bars Held"].clip(lower=floor)}
                 )
+                scatter_df = round_for_display(scatter_df)
                 fig_skew = px.scatter(
                     scatter_df, x="Median (plot)", y="Average (plot)", color="Outlier Trades %",
                     hover_data=hover, log_x=True, log_y=True, color_continuous_scale="OrRd",
@@ -845,11 +1062,11 @@ class OptimizationDashboard:
             x_col = names[x_metric]
             profit_df = plot_df.dropna(subset=[x_col])
             if not profit_df.empty:
-                profit_df = profit_df.assign(**{"Duration (plot)": profit_df[x_col].clip(lower=floor)})
+                profit_df = round_for_display(profit_df.assign(**{"Duration (plot)": profit_df[x_col].clip(lower=floor)}))
                 fig_profit = px.scatter(
                     profit_df, x="Duration (plot)", y="Net Profit", color="Equity Drawdown", log_x=True,
                     hover_data=hover, color_continuous_scale=px.colors.diverging.RdYlGn[::-1],
-                    labels={"Duration (plot)": f"{x_metric} holding time ({unit_label})", "Equity Drawdown": "Drawdown (%)"},
+                    labels={"Duration (plot)": f"{x_metric} holding time ({unit_label})", "Equity Drawdown": self._dd_label()},
                     title=f"{x_metric} holding time vs. Net Profit",
                 )
                 st.plotly_chart(fig_profit, width="stretch")
@@ -858,13 +1075,14 @@ class OptimizationDashboard:
         dist_df = plot_df.melt(id_vars=["Test_ID"], value_vars=dist_cols, var_name="Metric", value_name="Duration").dropna()
         if not dist_df.empty:
             dist_df["Metric"] = dist_df["Metric"].map({v: k for k, v in names.items()})
-            dist_df["Duration"] = dist_df["Duration"].clip(lower=floor)
+            dist_df["Duration"] = dist_df["Duration"].clip(lower=floor).round(4)
             fig_dist = px.box(
                 dist_df, x="Duration", y="Metric", color="Metric", points="outliers", log_x=True,
                 hover_data=["Test_ID"], labels={"Duration": f"Holding time per test ({unit_label})", "Metric": ""},
                 title="Distribution across tests",
             )
             fig_dist.update_layout(showlegend=False)
+            fig_dist.update_xaxes(hoverformat=".3~g")
             st.plotly_chart(fig_dist, width="stretch")
 
         st.markdown("#### 🔎 Tests with outlier positions")
@@ -877,12 +1095,94 @@ class OptimizationDashboard:
         ] if c in filtered_df.columns]
         outliers = filtered_df.nlargest(10, rank_by)[table_cols].round(3)
         st.caption("Bar values are in candles. Skew Ratio = average ÷ median; outliers are beyond Q3 + 3 × IQR on the log scale.")
-        st.dataframe(outliers, hide_index=True, width="stretch")
+        table_event = st.dataframe(
+            outliers, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="pd_outlier_table"
+        )
         st.download_button(
             "📥 Download Position Duration Stats (CSV)",
             data=filtered_df[table_cols].to_csv(index=False).encode("utf-8"),
             file_name="cTrader_position_duration.csv", mime="text/csv",
         )
+
+        self._render_trade_histogram(filtered_df, rank_by, unit, outliers, table_event)
+
+    def _render_trade_histogram(self, filtered_df: pd.DataFrame, rank_by: str, unit: str, outliers: pd.DataFrame, table_event):
+        """Per-trade holding time distribution of one selected test."""
+        st.markdown("#### 📊 Holding time distribution of a single test")
+        if "Hold_Hist" not in filtered_df.columns or filtered_df["Hold_Hist"].isna().all():
+            st.info("ℹ️ No per-trade duration data in the loaded dataset. Use **Rescan / Clear Cache** to rebuild it.")
+            return
+
+        candidates = filtered_df.dropna(subset=["Hold_Hist"]).sort_values(rank_by, ascending=False)
+        options = candidates["Test_ID"].tolist()
+        # A newly clicked table row takes over the selectbox; the selectbox stays free to change afterwards.
+        selected_rows = table_event.selection.rows if table_event is not None else []
+        clicked = outliers.iloc[selected_rows[0]]["Test_ID"] if selected_rows else None
+        if clicked is not None and clicked != st.session_state.get("pd_last_clicked") and clicked in options:
+            st.session_state["pd_hist_test"] = clicked
+        st.session_state["pd_last_clicked"] = clicked
+        if st.session_state.get("pd_hist_test") not in options:
+            st.session_state.pop("pd_hist_test", None)
+        test_id = st.selectbox(
+            "Test to inspect", options, key="pd_hist_test",
+            help="Pick a test, or click a row in the table above. Ordered by the ranking chosen above.",
+        )
+        row = candidates[candidates["Test_ID"] == test_id].iloc[0]
+
+        payload = json.loads(row["Hold_Hist"])
+        mode_col = {"all": 1, "long": 2, "short": 3}.get(self.mode, 1)
+        counts = np.zeros(HOLD_HIST_BINS)
+        for b in payload["bins"]:
+            counts[b[0]] = b[mode_col]
+        if counts.sum() == 0:
+            st.info(f"ℹ️ Test {test_id} has no {self.mode} positions.")
+            return
+
+        hours_edges = 10 ** (payload["start"] + payload["width"] * np.arange(HOLD_HIST_BINS + 1))
+        period_minutes = CTraderScanner._parse_period_minutes(row.get("Timeframe"))
+        in_candles = unit == "Candles" and period_minutes is not None
+        scale = 60.0 / period_minutes if in_candles else 1.0
+        unit_label = "candles" if in_candles else "hours"
+        edges = hours_edges * scale
+
+        # Trim empty bins at both ends so the axis focuses on the actual trades.
+        nonzero = np.nonzero(counts)[0]
+        lo, hi = nonzero[0], nonzero[-1] + 1
+        x = edges[lo:hi + 1]
+        y = np.append(counts[lo:hi], counts[hi - 1])
+        bin_labels = [f"{fmt_number(a)} – {fmt_number(b)}" for a, b in zip(edges[lo:hi], edges[lo + 1:hi + 1])]
+
+        fig = go.Figure(go.Scatter(
+            x=x, y=y, mode="lines", line_shape="hv", fill="tozeroy", line=dict(color="#636EFA"),
+            customdata=np.append(bin_labels, bin_labels[-1]), name="Positions",
+            hovertemplate=f"%{{customdata}} {unit_label}<br>Positions: %{{y:.0f}}<extra></extra>",
+        ))
+        markers = {"Average": ("Avg Bars Held", "#EF553B"), "Median": ("Median Bars Held", "#00CC96"),
+                   "P90": ("P90 Bars Held", "#FFA15A"), "Max": ("Max Bars Held", "#AB63FA")}
+        for i, (label, (col, color)) in enumerate(markers.items()):
+            if in_candles:
+                value = row.get(col)
+            elif label == "Average":
+                value = row.get("Avg Hold Time (h)")
+            else:
+                value = row.get(col) * period_minutes / 60.0 if period_minutes else np.nan
+            if pd.isna(value):
+                continue
+            # Vertical marker as a trace (not a shape), so it is placed in data units on the log axis.
+            top = float(counts.max()) * (1.02 + 0.06 * i)  # staggered so close labels do not overlap
+            fig.add_trace(go.Scatter(
+                x=[value, value], y=[0, top], mode="lines+text", line=dict(color=color, dash="dash", width=1.5),
+                text=["", f"{label}: {fmt_number(value)}"], textposition="top center", textfont=dict(color=color),
+                name=label, hovertemplate=f"{label}: {fmt_number(value)} {unit_label}<extra></extra>",
+            ))
+        fig.update_layout(
+            title=f"Test {test_id}: {int(counts.sum())} positions ({self.mode})",
+            xaxis_title=f"Holding time ({unit_label}, log scale)", yaxis_title="Positions", showlegend=False,
+            yaxis_range=[0, float(counts.max()) * 1.32],
+        )
+        fig.update_xaxes(type="log")
+        st.plotly_chart(fig, width="stretch")
+        st.caption("Bins are 1/5 of a decade wide; calendar time, so weekend holds count fully.")
 
     def _render_data_table(self, filtered_df: pd.DataFrame):
         st.subheader("4. 📋 Top Strategy Cluster (Data Table)")
@@ -939,12 +1239,28 @@ class OptimizationDashboard:
         self._render_metrics(len(df), filtered_df, mode_label)
 
         if not filtered_df.empty:
-            self._render_charts(filtered_df)
-            self._render_data_table(filtered_df)
-            self._render_search_space_pruning(filtered_df)
-            self._render_time_series(filtered_df)
-            self._render_trend_volatility(filtered_df, df)
-            self._render_position_duration(filtered_df)
+            sections = [
+                ("🎯 Overview", lambda: self._render_charts(filtered_df)),
+                ("📋 Data table", lambda: self._render_data_table(filtered_df)),
+                ("🔬 Pruning", lambda: self._render_search_space_pruning(filtered_df)),
+                ("📅 Time-Series", lambda: self._render_time_series(filtered_df)),
+                ("📈 Trend & Volatility", lambda: self._render_trend_volatility(filtered_df, df)),
+                ("⏱️ Position Duration", lambda: self._render_position_duration(filtered_df)),
+            ]
+            layout = st.segmented_control(
+                "Layout", ["List", "Tabs"], default="List", key="layout_mode",
+                help="List shows every section on one page (use it to export the full report as a full-page "
+                     "screenshot or PDF). Tabs show one section at a time and only compute the open one.",
+            ) or "List"
+            if layout == "Tabs":
+                tabs = st.tabs([name for name, _ in sections], key="section_tabs", on_change="rerun")
+                for tab, (_, render) in zip(tabs, sections):
+                    if tab.open:
+                        with tab:
+                            render()
+            else:
+                for _, render in sections:
+                    render()
         else:
             self._render_filter_diagnostics(df, filters)
 

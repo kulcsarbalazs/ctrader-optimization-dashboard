@@ -10,9 +10,6 @@ MODE_COLUMN = {"all": 1, "long": 2, "short": 3}
 # Pandas period codes: weeks run Monday-Sunday, months and years are calendar based.
 PERIOD_FREQ = {"W": "W-SUN", "M": "M", "Y": "Y"}
 
-# Fallback when a report does not state its starting capital.
-DEFAULT_CAPITAL = 10000.0
-
 MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
@@ -38,6 +35,10 @@ class TimeSeriesAnalyzer:
             return empty
 
         value_col = MODE_COLUMN.get(mode, 1)
+        # Starting capital: the scanner's "Starting Capital" (from the .optres settings or the report).
+        capitals = {}
+        if "Starting Capital" in df.columns:
+            capitals = {t: float(c) for t, c in zip(df["Test_ID"], df["Starting Capital"]) if pd.notna(c)}
         ranges, caps = {}, {}
         ids, dates, nets, trades, min_eqs = [], [], [], [], []
 
@@ -51,7 +52,7 @@ class TimeSeriesAnalyzer:
 
             start = np.datetime64(payload["start"], "D")
             ranges[test_id] = (pd.Timestamp(start), pd.Timestamp(np.datetime64(payload.get("end", payload["start"]), "D")))
-            caps[test_id] = float(payload.get("cap") or DEFAULT_CAPITAL)
+            caps[test_id] = capitals.get(test_id, payload.get("cap"))
             rows = payload.get("d") or []
             if not rows:
                 continue
@@ -194,8 +195,10 @@ class TimeSeriesAnalyzer:
                 .unstack("Test_ID")
                 .reindex(index=net.index, columns=net.columns)
             )
-        caps = pd.Series(long_df.attrs.get("caps", {}), dtype=float).reindex(net.columns).fillna(DEFAULT_CAPITAL)
-        return {"net": net, "min_eq": min_eq, "caps": caps}
+        caps = pd.Series(long_df.attrs.get("caps", {}), dtype=float).reindex(net.columns)
+        # Balance curves, ROI and drawdowns need the real starting capital; tests without one are left out.
+        known = caps.notna().to_numpy()
+        return {"net": net.loc[:, known], "min_eq": min_eq.loc[:, known], "caps": caps[known]}
 
     @staticmethod
     def equity_curves(mats: dict, roi: bool = False) -> pd.DataFrame:
@@ -207,21 +210,26 @@ class TimeSeriesAnalyzer:
         return (balance / mats["caps"] - 1.0) * 100.0 if roi else balance
 
     @staticmethod
-    def drawdown_curves(mats: dict, use_equity: bool = True) -> pd.DataFrame:
+    def drawdown_curves(mats: dict, use_equity: bool = True, absolute: bool = False) -> pd.DataFrame:
         """
-        Weekly drawdown (%, <= 0) from the running balance peak. With use_equity the week's
-        lowest equity is used as well, so intraweek floating losses are captured.
+        Weekly drawdown (%, <= 0; or the amount in account currency with absolute) from the
+        running balance peak. With use_equity the week's lowest equity is used as well, so
+        intraweek floating losses are captured.
         """
         net = mats["net"]
         if net.empty:
             return net
         balance = TimeSeriesAnalyzer.equity_curves(mats)
         running_peak = balance.cummax().clip(lower=mats["caps"], axis=1)
-        drawdown = (balance - running_peak) / running_peak * 100.0
+        drawdown = balance - running_peak
+        if not absolute:
+            drawdown = drawdown / running_peak * 100.0
         if use_equity:
             # The week's equity low is measured against the peak reached before that week.
             previous_peak = running_peak.shift(1).fillna(running_peak).clip(lower=mats["caps"], axis=1)
-            intraweek = (mats["min_eq"] - previous_peak) / previous_peak * 100.0
+            intraweek = mats["min_eq"] - previous_peak
+            if not absolute:
+                intraweek = intraweek / previous_peak * 100.0
             drawdown = np.fmin(drawdown, intraweek)
         drawdown = drawdown.clip(upper=0.0)
         return drawdown.where(net.notna())
@@ -296,3 +304,76 @@ class TimeSeriesAnalyzer:
         )
         stats.index.name = "period_start"
         return stats[stats["n"] > 0].reset_index()
+
+    # ==========================================
+    # SINGLE TEST BREAKDOWN
+    # ==========================================
+    @staticmethod
+    def test_periods(raw: str, capital: Optional[float], mode: str = "all", freq: str = "M", cumulative: bool = False) -> pd.DataFrame:
+        """
+        One test's P/L, trade count, win rate and drawdown per period (W / M / Y) from its
+        PnL_Series. Drawdown is measured from the running balance peak (with the intraday
+        equity low in "all" mode) and needs the starting capital; without it the column is NaN.
+        With cumulative, P/L and counts are running totals; the drawdown always stays per period.
+        """
+        columns = ["period_start", "net", "trades", "wins", "win_rate", "max_dd", "max_dd_amount", "balance"]
+        if not isinstance(raw, str) or not raw:
+            return pd.DataFrame(columns=columns)
+        payload = json.loads(raw)
+        start = pd.Timestamp(payload["start"])
+        days = pd.date_range(start, pd.Timestamp(payload.get("end", payload["start"])), freq="D")
+        daily = pd.DataFrame(0.0, index=days, columns=["net", "trades", "wins"])
+        daily["min_eq"] = np.nan
+
+        value_col = MODE_COLUMN.get(mode, 1)
+        for r in payload.get("d") or []:
+            day = start + pd.Timedelta(days=int(r[0]))
+            if day not in daily.index:
+                continue
+            has_counts = len(r) >= 9
+            trades_all, trades_long = r[4], (r[6] if has_counts else np.nan)
+            wins_all, wins_long = (r[7], r[8]) if has_counts else (np.nan, np.nan)
+            trades = {"all": trades_all, "long": trades_long, "short": trades_all - trades_long}[mode]
+            wins = {"all": wins_all, "long": wins_long, "short": wins_all - wins_long}[mode]
+            daily.loc[day, ["net", "trades", "wins"]] = [r[value_col], trades, wins]
+            if r[5] is not None:
+                daily.loc[day, "min_eq"] = r[5]
+
+        balance = pd.Series(np.nan, index=days)
+        drawdown = pd.Series(np.nan, index=days)
+        drawdown_amount = pd.Series(np.nan, index=days)
+        if capital is not None and pd.notna(capital):
+            balance = capital + daily["net"].cumsum()
+            peak = balance.cummax().clip(lower=capital)
+            drawdown_amount = balance - peak
+            drawdown = drawdown_amount / peak * 100.0
+            if mode == "all":
+                previous_peak = peak.shift(1).fillna(capital)
+                intraday = daily["min_eq"] - previous_peak
+                drawdown_amount = np.fmin(drawdown_amount, intraday)
+                drawdown = np.fmin(drawdown, intraday / previous_peak * 100.0)
+            drawdown = drawdown.clip(upper=0.0)
+            drawdown_amount = drawdown_amount.clip(upper=0.0)
+
+        pfreq = PERIOD_FREQ.get(freq, "M")
+        periods = days.to_period(pfreq)
+        grouped = pd.DataFrame(
+            {"net": daily["net"], "trades": daily["trades"], "wins": daily["wins"], "dd": drawdown,
+             "dd_amount": drawdown_amount, "balance": balance}
+        ).groupby(periods)
+        out = pd.DataFrame({
+            "net": grouped["net"].sum(),
+            "trades": grouped["trades"].sum(min_count=1),
+            "wins": grouped["wins"].sum(min_count=1),
+            "max_dd": grouped["dd"].min(),
+            "max_dd_amount": grouped["dd_amount"].min(),
+            "balance": grouped["balance"].last(),
+        })
+        if cumulative:
+            out["net"] = out["net"].cumsum()
+            out["trades"] = out["trades"].cumsum()
+            out["wins"] = out["wins"].cumsum()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["win_rate"] = np.where(out["trades"] > 0, out["wins"] / out["trades"] * 100.0, np.nan)
+        out["period_start"] = out.index.start_time
+        return out.reset_index(drop=True)[columns]

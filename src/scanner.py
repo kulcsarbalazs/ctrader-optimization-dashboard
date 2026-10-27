@@ -11,9 +11,15 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Union
 
 # Columns a cache file must contain to be reused; older caches trigger a rescan.
-REQUIRED_CACHE_COLUMNS = ("Total Trades_all", "PnL_Series", "Avg Bars Held_all")
-TIMESERIES_FORMAT_VERSION = 1
+REQUIRED_CACHE_COLUMNS = ("Total Trades_all", "PnL_Series", "Avg Bars Held_all", "Hold_Hist", "Equity Drawdown Amount")
+TIMESERIES_FORMAT_VERSION = 2
 DAY_MS = 24 * 3600 * 1000
+
+# Per-trade holding time histogram: log10(hours) bins of HOLD_HIST_WIDTH decades from HOLD_HIST_START
+# (0.0001 h = 0.36 s) to 10 000 h; shorter / longer positions fall into the first / last bin.
+HOLD_HIST_START = -4.0
+HOLD_HIST_WIDTH = 0.2
+HOLD_HIST_BINS = 40
 
 DURATION_METRICS = [
     "Avg Bars Held", "Median Bars Held", "P90 Bars Held", "Max Bars Held",
@@ -34,6 +40,7 @@ class CTraderScanner:
         clean_path = str(root_directory).strip().strip('"').strip("'").replace("\\ ", " ")
         self.root_dir = Path(clean_path).expanduser().resolve()
         self.cache_parquet = self.root_dir / "optimization_cache.parquet"
+        self._optres_capital_cache: Dict[str, Optional[float]] = {}
         self.cache_csv = self.root_dir / "optimization_cache.csv"
 
     # ==========================================
@@ -42,7 +49,15 @@ class CTraderScanner:
     @staticmethod
     def is_cache_compatible(df: Optional[pd.DataFrame]) -> bool:
         """True if a cached DataFrame has every column the current version needs."""
-        return df is not None and not df.empty and all(c in df.columns for c in REQUIRED_CACHE_COLUMNS)
+        if df is None or df.empty or not all(c in df.columns for c in REQUIRED_CACHE_COLUMNS):
+            return False
+        sample = df["PnL_Series"].dropna()
+        if sample.empty:
+            return True
+        try:
+            return json.loads(sample.iloc[0]).get("v", 1) >= TIMESERIES_FORMAT_VERSION
+        except (ValueError, TypeError):
+            return False
 
     def get_data(self, force_rescan: bool = False, progress_callback=None) -> Optional[pd.DataFrame]:
         """Manages caching in local mode and starts scanning."""
@@ -85,6 +100,56 @@ class CTraderScanner:
     # ==========================================
     # 1. CORE PARSERS
     # ==========================================
+    @staticmethod
+    def _optres_capital(raw: Union[str, bytes]) -> Optional[float]:
+        """Starting capital from a cTrader optimization results file (.optres, JSON)."""
+        try:
+            text = raw.decode("utf-8-sig", errors="ignore") if isinstance(raw, bytes) else raw.lstrip("\ufeff")
+            value = (json.loads(text).get("backtestingSettings") or {}).get("startingCapital")
+            return float(value) if value is not None else None
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    def _local_optres_capital(self, folder: Path) -> Optional[float]:
+        """
+        Looks for "<folder name>.optres" next to each parent of the test folder (cTrader saves
+        the optimization as <Name>.optres beside the <Name>/ results folder), up to the root's parent.
+        """
+        current = folder.parent
+        while True:
+            candidate = current.parent / f"{current.name}.optres"
+            key = str(candidate)
+            if key not in self._optres_capital_cache:
+                self._optres_capital_cache[key] = (
+                    self._optres_capital(candidate.read_bytes()) if candidate.is_file() else None
+                )
+            if self._optres_capital_cache[key] is not None:
+                return self._optres_capital_cache[key]
+            if current == self.root_dir or current.parent == current:
+                return None
+            current = current.parent
+
+    def _zip_optres_capital(self, z: zipfile.ZipFile, names: set, folder_path: str) -> Optional[float]:
+        """ZIP variant of the .optres lookup (folder paths use forward slashes)."""
+        current = os.path.dirname(folder_path)
+        while current:
+            candidate = f"{current}.optres"
+            if candidate not in self._optres_capital_cache:
+                self._optres_capital_cache[candidate] = (
+                    self._optres_capital(z.read(candidate)) if candidate in names else None
+                )
+            if self._optres_capital_cache[candidate] is not None:
+                return self._optres_capital_cache[candidate]
+            current = os.path.dirname(current)
+        return None
+
+    @staticmethod
+    def _apply_starting_capital(row_data: Dict[str, Any], optres_capital: Optional[float]):
+        """The optimization's own setting wins; the report's value is the fallback; unknown stays NaN."""
+        report_capital = row_data.pop("_report_capital", None)
+        capital = optres_capital if optres_capital is not None else report_capital
+        row_data["Starting Capital"] = float(capital) if capital is not None else np.nan
+
     def _extract_cbotset_logic(self, data: dict) -> Dict[str, Any]:
         """Extracts parameters from an already loaded JSON dictionary."""
         params = {}
@@ -97,7 +162,8 @@ class CTraderScanner:
         """
         Builds a compact daily P/L series from the closed trades (history.items) and the
         equity points of an already parsed report. Days are UTC calendar days.
-        Format: {"v", "start", "end", "cap", "d": [[day_idx, net_all, net_long, net_short, trades, min_eq]]}
+        Format: {"v", "start", "end", "cap", "d": [[day_idx, net_all, net_long, net_short, trades, min_eq,
+        trades_long, wins_all, wins_long]]} (short counts = all - long).
         Only active days are stored; weekly / monthly / yearly periods are aggregated from them
         and the inactive periods are zero-filled when the series is expanded.
         """
@@ -117,7 +183,7 @@ class CTraderScanner:
 
         def bucket(ts_ms: float) -> list:
             idx = max(0, int(ts_ms // DAY_MS) - start_day)
-            return days.setdefault(idx, [idx, 0.0, 0.0, 0.0, 0, None])
+            return days.setdefault(idx, [idx, 0.0, 0.0, 0.0, 0, None, 0, 0, 0])
 
         for t in trades:
             close_time = t.get("closeTime")
@@ -126,11 +192,12 @@ class CTraderScanner:
             net = float(t.get("net") or 0.0)
             row = bucket(close_time)
             row[1] += net
-            if str(t.get("direction", "")).lower() == "buy":
-                row[2] += net
-            else:
-                row[3] += net
+            is_long = str(t.get("direction", "")).lower() == "buy"
+            row[2 if is_long else 3] += net
             row[4] += 1
+            row[6] += int(is_long)
+            row[7] += int(net > 0)
+            row[8] += int(is_long and net > 0)
 
         for p in points:
             ts, min_eq = p.get("timestamp"), p.get("minEquity")
@@ -148,7 +215,8 @@ class CTraderScanner:
             "end": iso_day(int(end_ms // DAY_MS)),
             "cap": main.get("startingCapital"),
             "d": [
-                [r[0], round(r[1], 2), round(r[2], 2), round(r[3], 2), r[4], None if r[5] is None else round(r[5], 2)]
+                [r[0], round(r[1], 2), round(r[2], 2), round(r[3], 2), r[4],
+                 None if r[5] is None else round(r[5], 2), r[6], r[7], r[8]]
                 for r in (days[i] for i in sorted(days))
             ],
         }
@@ -162,6 +230,26 @@ class CTraderScanner:
             return None
         unit_minutes = {"m": 1, "h": 60, "d": 1440, "w": 10080}[match.group(1)]
         return float(unit_minutes * int(match.group(2)))
+
+    @staticmethod
+    def _hold_histogram(hold_hours: Dict[str, list]) -> Optional[str]:
+        """
+        Compact log-scale histogram of the per-trade holding times (hours), so a single test's
+        trade distribution can be shown later without re-reading the report.
+        Format: {"start", "width", "bins": [[bin_idx, count_all, count_long, count_short]]} (non-empty bins only).
+        """
+        if not hold_hours["all"]:
+            return None
+        counts = {}
+        for col, mode in enumerate(["all", "long", "short"], start=1):
+            if not hold_hours[mode]:
+                continue
+            log_hours = np.log10(np.maximum(np.asarray(hold_hours[mode]), 1e-9))
+            idx = np.clip(((log_hours - HOLD_HIST_START) // HOLD_HIST_WIDTH).astype(int), 0, HOLD_HIST_BINS - 1)
+            for b, n in zip(*np.unique(idx, return_counts=True)):
+                counts.setdefault(int(b), [int(b), 0, 0, 0])[col] = int(n)
+        payload = {"start": HOLD_HIST_START, "width": HOLD_HIST_WIDTH, "bins": [counts[b] for b in sorted(counts)]}
+        return json.dumps(payload, separators=(",", ":"))
 
     def _extract_duration_logic(self, data: dict) -> Dict[str, Any]:
         """
@@ -180,6 +268,8 @@ class CTraderScanner:
             hours = max(0.0, (close - entry) / 3_600_000)
             hold_hours["all"].append(hours)
             hold_hours["long" if str(t.get("direction", "")).lower() == "buy" else "short"].append(hours)
+
+        metrics["Hold_Hist"] = self._hold_histogram(hold_hours)
 
         for mode, values in hold_hours.items():
             for name in DURATION_METRICS:
@@ -210,7 +300,7 @@ class CTraderScanner:
 
     def _extract_report_logic(self, html: str) -> Dict[str, Any]:
         """Extracts and parses the pure JSON block from the HTML text."""
-        row_metrics = {"Equity Drawdown": 0.0, "PnL_Series": None, "Timeframe": None}
+        row_metrics = {"Equity Drawdown": 0.0, "Equity Drawdown Amount": 0.0, "PnL_Series": None, "Timeframe": None, "Hold_Hist": None, "_report_capital": None}
         for mode in ["all", "long", "short"]:
             for name in DURATION_METRICS:
                 row_metrics[f"{name}_{mode}"] = np.nan
@@ -237,6 +327,9 @@ class CTraderScanner:
 
             row_metrics["Equity Drawdown"] = float(
                 eq.get("maxEquityDrawdownPercent", eq.get("maxBalanceDrawdownPercent", 0.0))
+            )
+            row_metrics["Equity Drawdown Amount"] = float(
+                eq.get("maxEquityDrawdownAbsolute", eq.get("maxBalanceDrawdownAbsolute", 0.0))
             )
 
             mapping = {
@@ -289,6 +382,8 @@ class CTraderScanner:
                 win = row_metrics[f"Winning Trades_{mode}"]
                 row_metrics[f"Win Rate_{mode}"] = round((win / tot) * 100, 2) if tot > 0 else 0.0
 
+            row_metrics["_report_capital"] = (data.get("main") or {}).get("startingCapital")
+
             try:
                 row_metrics["PnL_Series"] = self._extract_timeseries_logic(data)
             except Exception:
@@ -321,6 +416,7 @@ class CTraderScanner:
                         folders.add(os.path.dirname(info.filename))
                 
                 valid_folders = [f for f in folders if f]
+                zip_names = set(z.namelist())
                 total_dirs = len(valid_folders)
                 
                 if total_dirs == 0:
@@ -354,7 +450,8 @@ class CTraderScanner:
                                 del html_content
                             except Exception:
                                 pass
-                    
+
+                    self._apply_starting_capital(row_data, self._zip_optres_capital(z, zip_names, folder_path))
                     results.append(row_data)
 
                     # MEMORY OPTIMIZATION: Force garbage collection periodically
@@ -424,6 +521,7 @@ class CTraderScanner:
                     except Exception:
                         pass
 
+                self._apply_starting_capital(row_data, self._local_optres_capital(folder))
                 results.append(row_data)
 
                 if idx > 0 and idx % 500 == 0:
@@ -452,7 +550,7 @@ class CTraderScanner:
         df = pd.DataFrame(results).sort_values(by="Test_ID")
         
         # Modern Pandas dtype conversion replacing the deprecated errors='ignore'
-        text_columns = {"Test_ID", "PnL_Series", "Timeframe"}
+        text_columns = {"Test_ID", "PnL_Series", "Timeframe", "Hold_Hist"}
         for col in df.columns:
             if col not in text_columns:
                 try:
