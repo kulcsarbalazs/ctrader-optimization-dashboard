@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import time
@@ -91,6 +92,20 @@ def round_for_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+PRESET_TYPE = "ctrader-optimization-dashboard/filter-preset"
+PRESET_MODES = {"all": "📊 Both (All)", "long": "📈 Only Long", "short": "📉 Only Short"}
+# Session-state keys of the filter widgets that a preset stores, with readable names.
+PRESET_FILTER_KEYS = {
+    "f_mode": "Trading mode", "dd_unit": "Drawdown unit",
+    "f_min_trades": "Minimum Trades", "f_profit": "Net Profit Range", "f_winrate": "Win Rate Range",
+    "f_max_dd_pct": "Max Equity Drawdown (%)", "f_max_dd_amount": "Max Equity Drawdown (amount)",
+    "f_pf": "Profit Factor Range", "f_max_cons": "Max Consecutive Losses",
+    "f_largest_win": "Largest Winning Trade", "f_largest_loss": "Largest Losing Trade",
+    "f_avg_trade": "Average Trade Result", "f_swaps": "Swaps Range",
+    "f_min_r2": "Min Trend Stability (R²)", "f_max_ulcer": "Max Ulcer Index", "f_max_underwater": "Max Time Underwater",
+    "f_duration_metric": "Duration metric", "f_bars_range": "Bars held range", "f_bars_cap": "Max single position",
+}
+
 TREND_COLUMNS = ["Trend R²", "Ulcer Index", "Max Underwater (w)", "Weekly Vol %", "Weekly Sharpe"]
 MAX_SAVED_SETS = 4
 SET_COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A"]
@@ -133,13 +148,151 @@ class OptimizationDashboard:
                 # Silently ignore files that are locked or already deleted
                 pass
 
-    def _safe_range_slider(self, label: str, series: pd.Series, step: float = None) -> tuple:
-        """Safe slider that prevents UI crash when min == max."""
+    # ==========================================
+    # KEYED FILTER WIDGETS (presets can set them)
+    # ==========================================
+    @staticmethod
+    def _same(a, b) -> bool:
+        """Value equality that tolerates float noise and list/tuple differences (JSON round trips)."""
+        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+            return len(a) == len(b) and all(OptimizationDashboard._same(x, y) for x, y in zip(a, b))
+        if isinstance(a, (int, float, np.number)) and isinstance(b, (int, float, np.number)):
+            return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)), abs(float(b)))
+        return a == b
+
+    def _sync_filter_state(self, key: str, default, normalize):
+        """
+        Puts the value a keyed filter widget should show into session state before it is created:
+        a pending preset value (normalized to this dataset's bounds), else the default when the widget
+        is new or was left at its old default while the bounds changed, else the user's value (normalized).
+        """
+        state = st.session_state
+        pending = state.get("_preset_pending") or {}
+        old_default = state.get(f"_default__{key}")
+        if key in pending:
+            raw = pending.pop(key)
+            try:
+                value = normalize(raw)
+            except (TypeError, ValueError):
+                value = default
+            if not self._same(value, raw):
+                state.setdefault("_preset_adjusted", []).append(key)
+        elif key not in state or (
+            old_default is not None and self._same(state[key], old_default) and not self._same(old_default, default)
+        ):
+            value = default
+        else:
+            try:
+                value = normalize(state[key])
+            except (TypeError, ValueError):
+                value = default
+        state[key] = value
+        state[f"_default__{key}"] = default
+
+    def _filter_slider(self, label: str, key: str, lo, hi, default=None, step=None, **kwargs):
+        """Sidebar slider (single value or range) whose value can be set by a preset."""
+        is_int = isinstance(lo, (int, np.integer)) and isinstance(hi, (int, np.integer)) and not isinstance(step, float)
+        cast = int if is_int else float
+        clamp = lambda v: min(max(cast(v), lo), hi)
+        if isinstance(default, tuple):
+            normalize = lambda v: tuple(sorted((clamp(v[0]), clamp(v[1]))))
+        else:
+            normalize = clamp
+        self._sync_filter_state(key, default, normalize)
+        return st.sidebar.slider(label, min_value=lo, max_value=hi, step=step, key=key, **kwargs)
+
+    def _range_filter(self, label: str, key: str, series: pd.Series, step: float = None) -> tuple:
+        """Full-range filter slider that prevents a UI crash when min == max."""
         s_min = float(series.min()) if not series.empty else 0.0
         s_max = float(series.max()) if not series.empty else 1.0
         if s_min >= s_max:
             s_max = s_min + 1.0
-        return st.sidebar.slider(label, min_value=s_min, max_value=s_max, value=(s_min, s_max), step=step)
+        return self._filter_slider(label, key, s_min, s_max, (s_min, s_max), step=step)
+
+    def _filter_choice(self, widget, label: str, key: str, options: list, default, **kwargs):
+        """Sidebar selectbox / segmented control whose value can be set by a preset."""
+        self._sync_filter_state(key, default, lambda v: v if v in options else default)
+        return widget(label, options, key=key, **kwargs)
+
+    def _filter_select_slider(self, label: str, key: str, options: list, default, **kwargs):
+        """Sidebar select_slider; preset values snap to the nearest available step."""
+        def snap(v):
+            return options[int(np.argmin([abs(o - float(v)) for o in options]))]
+        normalize = (lambda v: tuple(sorted((snap(v[0]), snap(v[1]))))) if isinstance(default, tuple) else snap
+        self._sync_filter_state(key, default, normalize)
+        return st.sidebar.select_slider(label, options=options, key=key, **kwargs)
+
+    # ==========================================
+    # FILTER PRESETS (download / upload as JSON)
+    # ==========================================
+    def _consume_preset_upload(self):
+        """Turns a newly uploaded preset file into pending widget values (applied as the widgets are built)."""
+        state = st.session_state
+        upload = state.get("preset_upload")
+        if upload is None or upload.file_id == state.get("_preset_applied_id"):
+            return
+        state["_preset_applied_id"] = upload.file_id
+        state["_preset_adjusted"] = []
+        try:
+            preset = json.loads(upload.getvalue().decode("utf-8-sig"))
+            if preset.get("type") != PRESET_TYPE or not isinstance(preset.get("filters"), dict):
+                raise ValueError("not a filter preset of this dashboard")
+        except (ValueError, UnicodeDecodeError) as exc:
+            state["_preset_message"] = ("error", f"Could not load {upload.name}: {exc}")
+            return
+        values = {k: v for k, v in preset["filters"].items() if k in PRESET_FILTER_KEYS}
+        if "f_mode" in values:
+            values["f_mode"] = PRESET_MODES.get(values["f_mode"], values["f_mode"])
+        state["_preset_pending"] = values
+        state["_preset_message"] = ("success", f"Loaded preset **{preset.get('name') or upload.name}** ({len(values)} filters).")
+
+    def _render_preset_controls(self):
+        """Sidebar block to download the current filters as a preset file and to load one."""
+        state = st.session_state
+        st.sidebar.divider()
+        st.sidebar.header("💾 Filter Presets")
+
+        message = state.pop("_preset_message", None)
+        if message:
+            (st.sidebar.success if message[0] == "success" else st.sidebar.error)(message[1])
+        adjusted = state.pop("_preset_adjusted", [])
+        if adjusted:
+            st.sidebar.warning(
+                "Adjusted to this dataset's range: " + ", ".join(PRESET_FILTER_KEYS[k] for k in adjusted if k in PRESET_FILTER_KEYS)
+            )
+        unused = state.pop("_preset_pending", {})
+        # Only one of the two drawdown sliders exists at a time; the other one is not "missing".
+        inactive_dd = "f_max_dd_pct" if self.dd_amount else "f_max_dd_amount"
+        unused.pop(inactive_dd, None)
+        if unused:
+            st.sidebar.caption(
+                "ℹ️ Not available for this dataset, skipped: " + ", ".join(PRESET_FILTER_KEYS[k] for k in unused)
+            )
+
+        name = st.sidebar.text_input("Preset name", placeholder="e.g. Low DD, steady curve", key="preset_name")
+        filters = {k: (list(state[k]) if isinstance(state[k], tuple) else state[k])
+                   for k in PRESET_FILTER_KEYS if k in state and k != inactive_dd}
+        if "f_mode" in filters:
+            # Stored as a stable code ("all" / "long" / "short") instead of the emoji label.
+            filters["f_mode"] = {label: code for code, label in PRESET_MODES.items()}.get(filters["f_mode"], filters["f_mode"])
+        preset = {
+            "type": PRESET_TYPE,
+            "version": 1,
+            "name": name.strip() or None,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": Path(str(self.root_dir)).name if self.run_mode != "cloud" else "cloud upload",
+            "filters": filters,
+        }
+        file_stub = re.sub(r"[^A-Za-z0-9_-]+", "_", name.strip()).strip("_") or "filters"
+        st.sidebar.download_button(
+            "📥 Save filters as preset", data=json.dumps(preset, indent=2, default=float).encode("utf-8"),
+            file_name=f"cTrader_preset_{file_stub}_{time.strftime('%Y%m%d-%H%M')}.json", mime="application/json",
+            width="stretch",
+        )
+        st.sidebar.file_uploader(
+            "Load preset", type=["json"], key="preset_upload",
+            help="Sets every filter from the file; values outside this dataset's range are moved to the nearest edge.",
+        )
 
     @staticmethod
     def _log_steps(series: pd.Series, count: int = 60) -> list:
@@ -270,15 +423,14 @@ class OptimizationDashboard:
         # --- 1. TRADING MODE SELECTION ---
         st.sidebar.divider()
         st.sidebar.header("⚙️ Trading Mode")
-        mode_label = st.sidebar.selectbox(
-            "Select direction to analyze:",
-            ["📊 Both (All)", "📈 Only Long", "📉 Only Short"],
-        )
+        self._consume_preset_upload()
+        mode_options = list(PRESET_MODES.values())
+        mode_label = self._filter_choice(st.sidebar.selectbox, "Select direction to analyze:", "f_mode", mode_options, mode_options[0])
         mode = "all" if "Both" in mode_label else ("long" if "Long" in mode_label else "short")
         self.mode = mode
         has_dd_amount = "Equity Drawdown Amount" in raw_df.columns
-        dd_unit = st.sidebar.segmented_control(
-            "Show drawdown as", ["%", "Amount"], default="%", key="dd_unit", disabled=not has_dd_amount,
+        dd_unit = self._filter_choice(
+            st.sidebar.segmented_control, "Show drawdown as", "dd_unit", ["%", "Amount"], "%", disabled=not has_dd_amount,
             help="Percent of the peak balance, or the amount in account currency. Applies to filters, charts and tables.",
         ) or "%"
         self.dd_amount = dd_unit == "Amount" and has_dd_amount
@@ -313,20 +465,19 @@ class OptimizationDashboard:
         max_trades = int(active_df["Total Trades"].max()) if not active_df.empty else 1
         if max_trades <= 0:
             max_trades = 1
-        min_trades = st.sidebar.slider(
-            "Minimum Trades", min_value=0, max_value=max_trades, value=min(10, max_trades)
-        )
+        min_trades = self._filter_slider("Minimum Trades", "f_min_trades", 0, max_trades, min(10, max_trades))
 
-        profit_range = self._safe_range_slider("Net Profit Range", active_df["Net Profit"])
-        winrate_range = st.sidebar.slider("Win Rate (%) Range", 0.0, 100.0, (0.0, 100.0))
+        profit_range = self._range_filter("Net Profit Range", "f_profit", active_df["Net Profit"])
+        winrate_range = self._filter_slider("Win Rate (%) Range", "f_winrate", 0.0, 100.0, (0.0, 100.0))
         if self.dd_amount:
             dd_max = float(np.ceil(active_df["Equity Drawdown"].max() or 1.0))
             dd_step = 10.0 if dd_max > 1000 else 1.0
             dd_max = float(np.ceil(dd_max / dd_step) * dd_step)
-            max_dd = st.sidebar.slider("Max Equity Drawdown (amount)", 0.0, max(dd_max, 1.0), max(dd_max, 1.0), step=dd_step)
+            max_dd = self._filter_slider("Max Equity Drawdown (amount)", "f_max_dd_amount",
+                                         0.0, max(dd_max, 1.0), max(dd_max, 1.0), step=dd_step)
         else:
-            max_dd = st.sidebar.slider("Max Equity Drawdown (%)", 0.0, 100.0, 100.0)
-        pf_range = self._safe_range_slider("Profit Factor Range", active_df["Profit Factor"], step=0.05)
+            max_dd = self._filter_slider("Max Equity Drawdown (%)", "f_max_dd_pct", 0.0, 100.0, 100.0)
+        pf_range = self._range_filter("Profit Factor Range", "f_pf", active_df["Profit Factor"], step=0.05)
 
         # --- 4. DETAILED RISK FILTERS ---
         st.sidebar.divider()
@@ -335,32 +486,30 @@ class OptimizationDashboard:
         max_cons_val = int(active_df["Max Cons. Losses"].max()) if not active_df.empty else 10
         if max_cons_val <= 0:
             max_cons_val = 1
-        max_cons_losses = st.sidebar.slider(
-            "Max Consecutive Losses", min_value=0, max_value=max_cons_val, value=max_cons_val
-        )
+        max_cons_losses = self._filter_slider("Max Consecutive Losses", "f_max_cons", 0, max_cons_val, max_cons_val)
 
-        largest_win_range = self._safe_range_slider("Largest Winning Trade", active_df["Largest Win"])
-        largest_loss_range = self._safe_range_slider("Largest Losing Trade", active_df["Largest Loss"])
-        avg_trade_range = self._safe_range_slider("Average Trade Result", active_df["Average Trade"])
-        swaps_range = self._safe_range_slider("Swaps Range", active_df["Swaps"])
+        largest_win_range = self._range_filter("Largest Winning Trade", "f_largest_win", active_df["Largest Win"])
+        largest_loss_range = self._range_filter("Largest Losing Trade", "f_largest_loss", active_df["Largest Loss"])
+        avg_trade_range = self._range_filter("Average Trade Result", "f_avg_trade", active_df["Average Trade"])
+        swaps_range = self._range_filter("Swaps Range", "f_swaps", active_df["Swaps"])
 
         # --- 5. TREND & STABILITY FILTERS ---
         trend_filters = {}
         if "Trend R²" in active_df.columns:
             st.sidebar.divider()
             st.sidebar.header("📈 Trend & Stability Filters")
-            min_r2 = st.sidebar.slider(
-                "Min Trend Stability (R²)", -1.0, 1.0, -1.0, step=0.01,
+            min_r2 = self._filter_slider(
+                "Min Trend Stability (R²)", "f_min_r2", -1.0, 1.0, -1.0, step=0.01,
                 help="Linear fit of the weekly balance curve: 1 = perfectly steady growth, negative = steady decline.",
             )
             ulcer_max = float(np.ceil(active_df["Ulcer Index"].max() or 1.0))
-            max_ulcer = st.sidebar.slider(
-                "Max Ulcer Index", 0.0, max(ulcer_max, 1.0), max(ulcer_max, 1.0), step=0.05,
+            max_ulcer = self._filter_slider(
+                "Max Ulcer Index", "f_max_ulcer", 0.0, max(ulcer_max, 1.0), max(ulcer_max, 1.0), step=0.05,
                 help="Depth and duration of drawdowns combined (root mean square of the weekly drawdown %).",
             )
             uw_max = int(active_df["Max Underwater (w)"].max() or 1)
-            max_underwater = st.sidebar.slider(
-                "Max Time Underwater (weeks)", 0, max(uw_max, 1), max(uw_max, 1),
+            max_underwater = self._filter_slider(
+                "Max Time Underwater (weeks)", "f_max_underwater", 0, max(uw_max, 1), max(uw_max, 1),
                 help="Longest stretch the balance stayed below its previous peak.",
             )
             trend_filters = {
@@ -376,19 +525,19 @@ class OptimizationDashboard:
             st.sidebar.header("⏱️ Position Duration")
             if active_df["Timeframe"].nunique() > 1:
                 st.sidebar.warning("Mixed timeframes: candle counts are not comparable across tests.")
-            duration_metric = st.sidebar.selectbox(
-                "Filter on (bars held per test)", ["Average", "Median", "P90"],
+            duration_metric = self._filter_choice(
+                st.sidebar.selectbox, "Filter on (bars held per test)", "f_duration_metric", ["Average", "Median", "P90"], "Average",
                 help="Holding time of the positions divided by the candle size of the report's timeframe.",
             )
             duration_col = {"Average": "Avg Bars Held", "Median": "Median Bars Held", "P90": "P90 Bars Held"}[duration_metric]
             steps = self._log_steps(active_df[duration_col])
-            bars_range = st.sidebar.select_slider(
-                f"{duration_metric} bars held (min / max)", options=steps, value=(steps[0], steps[-1]),
+            bars_range = self._filter_select_slider(
+                f"{duration_metric} bars held (min / max)", "f_bars_range", steps, (steps[0], steps[-1]),
                 help="Log-scaled steps, so short and long holding times can both be set precisely.",
             )
             cap_steps = self._log_steps(active_df["Max Bars Held"])
-            max_bars_cap = st.sidebar.select_slider(
-                "Max single position (bars)", options=cap_steps, value=cap_steps[-1],
+            max_bars_cap = self._filter_select_slider(
+                "Max single position (bars)", "f_bars_cap", cap_steps, cap_steps[-1],
                 help="Excludes tests that held any single position longer than this.",
             )
             duration_filters = {
@@ -414,6 +563,8 @@ class OptimizationDashboard:
             "trend_filters": trend_filters,
             "duration_filters": duration_filters,
         }
+
+        self._render_preset_controls()
 
         st.sidebar.divider()
         st.sidebar.markdown("### 👨‍💻 About the Author")

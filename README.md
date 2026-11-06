@@ -68,6 +68,9 @@ How long do positions stay open, measured in candles of the report's timeframe (
 
 ---
 
+### Filter presets
+Save every sidebar filter (trading mode, drawdown unit, performance, risk, trend and duration filters) as a named `.json` preset that your browser downloads, and load it later to restore the exact same filter state and results. When a preset is loaded on a different dataset, values outside its range are moved to the nearest edge and the sidebar tells you which ones.
+
 ### Layout: list or tabs
 A switch above the sections shows them either as one long list (use this to export the full report as a full-page screenshot or PDF) or as tabs, where only the open tab is computed.
 
